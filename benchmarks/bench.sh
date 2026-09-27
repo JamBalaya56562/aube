@@ -21,7 +21,9 @@ set -euo pipefail
 #                  take: see `runs = "auto"` in benchmarks/tak.toml.
 #   RESULTS_JSON — override the structured JSON output path
 #   BENCH_TOOLS  — comma-separated tools to include
-#                  (default: aube,bun,pnpm,npm,yarn,deno; vlt is
+#                  (default: aube,aube-nogvs,bun,pnpm,npm,yarn,deno;
+#                  aube-nogvs is aube with the global virtual store
+#                  off, the layout aube uses under CI; vlt is
 #                  temporarily disabled — its --frozen-lockfile still
 #                  makes network requests, skewing results)
 #   BENCH_SCENARIOS — comma-separated scenario keys to run
@@ -61,7 +63,7 @@ WARMUP="${WARMUP:-1}"
 # Unset means benchmarks/tak.toml's `runs = "auto"`: tak sizes each tool's
 # run count from how long its samples take, within `min_runs`.
 RUNS="${RUNS:-}"
-BENCH_TOOLS="${BENCH_TOOLS:-aube,bun,pnpm,npm,yarn,deno}"
+BENCH_TOOLS="${BENCH_TOOLS:-aube,aube-nogvs,bun,pnpm,npm,yarn,deno}"
 BENCH_SCENARIOS="${BENCH_SCENARIOS:-gvs-warm,gvs-cold,pull-update,install-test}"
 BENCH_PHASES="${BENCH_PHASES:-1}"
 
@@ -153,6 +155,7 @@ scenario_selected() {
 # Order matters for the console output; keep aube first so the
 # headline comparison is prominent and the rest follow alphabetically.
 register_tool "aube" "$AUBE_BIN"
+register_tool "aube-nogvs" "$AUBE_BIN"
 register_tool "bun" "$BUN_BIN"
 register_tool "deno" "$DENO_BIN"
 register_tool "pnpm" "$PNPM_BIN"
@@ -222,7 +225,7 @@ echo "workdir: $BENCH_DIR"
 # benchmarks/tak.toml) into every scenario's export, and generate-results.js
 # reads it from there.
 for i in "${!TOOLS[@]}"; do
-	printf "%-5s %s\n" "${TOOLS[$i]}:" "${TOOL_BINS[$i]}"
+	printf "%-11s %s\n" "${TOOLS[$i]}:" "${TOOL_BINS[$i]}"
 done
 echo ""
 
@@ -232,7 +235,7 @@ echo ""
 # scenarios.
 lockfile_name_for() {
 	case "$1" in
-	aube) echo "aube-lock.yaml" ;;
+	aube | aube-nogvs) echo "aube-lock.yaml" ;;
 	bun) echo "bun.lock" ;;
 	deno) echo "deno.lock" ;;
 	npm) echo "package-lock.json" ;;
@@ -321,9 +324,11 @@ fi
 # Run the non-frozen install of the tool at index $1 in its project directory: it resolves
 # whatever package.json asks for, building on a lockfile that is already
 # there, and fills the store and cache. `update` as $2 marks an incremental
-# update of an existing lockfile rather than a first resolve.
+# update of an existing lockfile rather than a first resolve. $3 names the
+# saved lockfile being produced (`before-`, `after-`, or empty for the
+# fixture's), so aube-nogvs can start from aube's lockfile for that step.
 populate_install() {
-	local i=$1 mode=${2:-fresh}
+	local i=$1 mode=${2:-fresh} stage=${3:-}
 	local tool="${TOOLS[$i]}" dir="${TOOL_PROJECTS[$i]}" bin="${TOOL_BINS[$i]}"
 	local home="${TOOL_HOMES[$i]}" cache="${TOOL_CACHES[$i]}"
 	local bun_args=(--cache-dir "$cache" --ignore-scripts --no-summary)
@@ -333,6 +338,17 @@ populate_install() {
 		# Aube's built-in trusted-dependency list can allow known-safe
 		# install scripts; opt out explicitly to match every other PM.
 		cd "$dir" && HOME="$home" XDG_CACHE_HOME="$cache" XDG_DATA_HOME="$home/.local/share" "$bin" install --ignore-scripts
+		;;
+	aube-nogvs)
+		# Same binary as aube with the global virtual store off. Start
+		# from the lockfile aube saved for this step when aube ran too,
+		# so both subjects install the identical graph and differ only
+		# in layout.
+		if [ -f "$BENCH_DIR/saved-lockfile-${stage}aube" ]; then
+			cp "$BENCH_DIR/saved-lockfile-${stage}aube" "$dir/aube-lock.yaml"
+		fi
+		cd "$dir" && HOME="$home" XDG_CACHE_HOME="$cache" XDG_DATA_HOME="$home/.local/share" \
+			npm_config_enable_global_virtual_store=false "$bin" install --ignore-scripts
 		;;
 	npm)
 		# `--legacy-peer-deps` is the only way npm tolerates the
@@ -427,10 +443,10 @@ if scenario_selected "pull-update"; then
 		echo "Resolving the dependency update for $tool..."
 		reset_project "$dir"
 		cp "$BENCH_DIR/before-package.json" "$dir/package.json"
-		populate_install "$i"
+		populate_install "$i" fresh before-
 		cp "$dir/$lockfile_name" "$BENCH_DIR/saved-lockfile-before-$tool"
 		cp "$BENCH_DIR/after-package.json" "$dir/package.json"
-		populate_install "$i" update
+		populate_install "$i" update after-
 		cp "$dir/$lockfile_name" "$BENCH_DIR/saved-lockfile-after-$tool"
 		reset_project "$dir"
 		cp "$SCRIPT_DIR/fixture.package.json" "$dir/package.json"
