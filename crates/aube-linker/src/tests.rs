@@ -1127,7 +1127,7 @@ fn cached_entry_repair_rejects_dependency_path_escape() {
 }
 
 #[test]
-fn test_hidden_hoist_is_rebuilt_on_relink() {
+fn test_hidden_hoist_reconciles_on_relink() {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -1158,9 +1158,24 @@ fn test_hidden_hoist_is_rebuilt_on_relink() {
     let hidden = project_dir.join("node_modules/.aube/node_modules");
 
     linker.link_all(&project_dir, &graph, &indices).unwrap();
-    // A stray entry from an earlier graph must not survive the rebuild.
+    #[cfg(unix)]
+    let original_foo_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(hidden.join("foo")).unwrap().ino()
+    };
+    // A stray entry from an earlier graph must not survive reconciliation.
     std::fs::write(hidden.join("gone"), "").unwrap();
     linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::symlink_metadata(hidden.join("foo")).unwrap().ino(),
+            original_foo_inode,
+            "an unchanged hidden-hoist link should survive a repeat install"
+        );
+    }
 
     for name in ["foo", "bar", "@scope/baz", "Bar"] {
         let link = hidden.join(name);
@@ -1185,6 +1200,121 @@ fn test_hidden_hoist_is_rebuilt_on_relink() {
         );
     }
     assert!(!hidden.join("gone").exists());
+
+    graph.packages.remove("@scope/baz@1.0.0");
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert!(!hidden.join("@scope/baz").exists());
+
+    let old_foo_target = std::fs::read_link(hidden.join("foo")).unwrap();
+    assert!(hidden.join(&old_foo_target).exists());
+    let new_foo_file = store
+        .import_bytes(b"module.exports = 'foo v2';", false)
+        .unwrap();
+    let mut new_foo_index = PackageIndex::default();
+    new_foo_index.insert("index.js".to_string(), new_foo_file);
+    indices.insert("foo@2.0.0".to_string(), new_foo_index);
+    let mut new_foo = graph.packages.remove("foo@1.0.0").unwrap();
+    new_foo.version = "2.0.0".to_string();
+    new_foo.dep_path = "foo@2.0.0".to_string();
+    graph.packages.insert(new_foo.dep_path.clone(), new_foo);
+    graph.importers.get_mut(".").unwrap()[0].dep_path = "foo@2.0.0".to_string();
+
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert!(hidden.join(&old_foo_target).exists());
+    assert_ne!(
+        std::fs::read_link(hidden.join("foo")).unwrap(),
+        old_foo_target
+    );
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("foo/index.js")).unwrap(),
+        "module.exports = 'foo v2';"
+    );
+
+    // `Bar` and `bar` share one slot on case-insensitive filesystems.
+    // Removing the later package's source must leave the earlier live link.
+    std::fs::remove_dir_all(project_dir.join("node_modules/.aube/bar@2.0.0/node_modules/bar"))
+        .unwrap();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("Bar/index.js")).unwrap(),
+        "module.exports = 'Bar';"
+    );
+}
+
+#[test]
+fn hidden_hoist_drops_link_when_package_source_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let linker = Linker::new(&store, LinkStrategy::Copy);
+    let graph = make_graph();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let aube_dir = project_dir.join("node_modules/.aube");
+    let hidden_foo = aube_dir.join("node_modules/foo");
+    assert!(hidden_foo.exists());
+    std::fs::remove_dir_all(aube_dir.join("foo@1.0.0/node_modules/foo")).unwrap();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    assert!(std::fs::symlink_metadata(hidden_foo).is_err());
+    assert!(aube_dir.join("node_modules/bar/index.js").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn hidden_hoist_replaces_tampered_scope_without_following_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, mut indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    let dep_path = "@scope/pkg@1.0.0";
+    let stored = store.import_bytes(b"ok", false).unwrap();
+    let mut index = PackageIndex::default();
+    index.insert("index.js".to_string(), stored);
+    indices.insert(dep_path.to_string(), index);
+    graph.packages.insert(
+        dep_path.to_string(),
+        LockedPackage {
+            name: "@scope/pkg".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: dep_path.to_string(),
+            ..Default::default()
+        },
+    );
+    let linker = Linker::new(&store, LinkStrategy::Copy);
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let hidden = project_dir.join("node_modules/.aube/node_modules");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let sentinel = outside.join("sentinel");
+    std::fs::write(&sentinel, "keep").unwrap();
+    std::fs::remove_dir_all(hidden.join("@scope")).unwrap();
+    std::os::unix::fs::symlink(&outside, hidden.join("@scope")).unwrap();
+
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+    assert!(hidden.join("@scope/pkg/index.js").exists());
+    assert!(
+        !std::fs::symlink_metadata(hidden.join("@scope"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    std::fs::remove_dir_all(&hidden).unwrap();
+    std::os::unix::fs::symlink(&outside, &hidden).unwrap();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+    assert!(hidden.join("@scope/pkg/index.js").exists());
+    assert!(
+        !std::fs::symlink_metadata(&hidden)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]

@@ -8,8 +8,8 @@ use crate::pool::with_link_pool;
 use crate::sweep::{
     EntryState, classify_entry_state, classify_local_entry_state, create_dir_link_idempotent,
     is_physical_importer, mkdirp, reconcile_dir_link, remove_hidden_hoist_tree,
-    sweep_dead_hidden_hoist_entries, sweep_stale_tmp_dirs, sweep_stale_top_level_entries,
-    try_remove_entry,
+    sweep_dead_hidden_hoist_entries, sweep_stale_hidden_hoist_entries, sweep_stale_tmp_dirs,
+    sweep_stale_top_level_entries, try_remove_entry,
 };
 use crate::{Error, HoistedPlacements, LinkStats, Linker, NodeLinker, hoisted, sys};
 use aube_lockfile::{LocalSource, LockedPackage, LockfileGraph};
@@ -1493,13 +1493,14 @@ impl Linker {
             }
             return Ok(());
         }
-        // Wipe before repopulating so a dependency removed from the
-        // graph (or a pattern that no longer matches) doesn't linger.
-        // The shared GVS hidden hoist only prunes broken entries:
-        // removing live cross-project links would make the directory
-        // last-writer-wins for sequential installs.
+        // The project-owned hidden hoist can drop names removed from this
+        // graph while keeping correctly targeted links. The shared GVS
+        // hidden hoist only prunes broken entries: removing live links
+        // there would disrupt another project.
         if sweep_stale_entries {
-            remove_hidden_hoist_tree(&hidden);
+            let preserve: rustc_hash::FxHashSet<&str> =
+                packages.iter().map(|(_, pkg)| pkg.name.as_str()).collect();
+            sweep_stale_hidden_hoist_entries(&hidden, &preserve);
         } else {
             sweep_dead_hidden_hoist_entries(&hidden);
         }
@@ -1532,6 +1533,28 @@ impl Linker {
         let (case_colliding, independent): (Vec<_>, Vec<_>) = packages
             .iter()
             .partition(|(_, pkg)| folded[&pkg.name.to_lowercase()] > 1);
+        // On case-insensitive filesystems, two case-colliding names can
+        // address the same hidden link. If a later package's source is
+        // missing, it must not remove a link just placed for an earlier
+        // package whose source is still present.
+        let mut valid_collision_sources: rustc_hash::FxHashMap<
+            String,
+            rustc_hash::FxHashSet<PathBuf>,
+        > = rustc_hash::FxHashMap::default();
+        if sweep_stale_entries {
+            for &&(dep_path, pkg) in &case_colliding {
+                let source_dir = source_root
+                    .join(self.aube_dir_entry_name(dep_path))
+                    .join("node_modules")
+                    .join(&pkg.name);
+                if let Ok(canonical_source) = source_dir.canonicalize() {
+                    valid_collision_sources
+                        .entry(pkg.name.to_lowercase())
+                        .or_default()
+                        .insert(canonical_source);
+                }
+            }
+        }
         use rayon::prelude::*;
         let link_one = |(dep_path, pkg): &&(&String, &LockedPackage)| -> Result<(), Error> {
             let source_subdir = if use_hashed_subdirs {
@@ -1543,20 +1566,24 @@ impl Linker {
                 .join(source_subdir)
                 .join("node_modules")
                 .join(&pkg.name);
+            let target_dir = hidden.join(&pkg.name);
             if !source_dir.exists() {
+                if sweep_stale_entries {
+                    let points_to_live_collision =
+                        target_dir.canonicalize().ok().is_some_and(|target| {
+                            valid_collision_sources
+                                .get(&pkg.name.to_lowercase())
+                                .is_some_and(|targets| targets.contains(&target))
+                        });
+                    if !points_to_live_collision {
+                        try_remove_entry(&target_dir);
+                    }
+                }
                 return Ok(());
             }
-            let target_dir = hidden.join(&pkg.name);
             let link_parent = target_dir.parent().unwrap_or(&hidden);
             let rel_target = pathdiff::diff_paths(&source_dir, link_parent)
                 .unwrap_or_else(|| source_dir.clone());
-            // After a wipe the tree is empty, so skip the link check that
-            // every entry would miss. Something that survived the wipe
-            // falls through to the reconcile below.
-            if sweep_stale_entries && sys::create_dir_link(&rel_target, &target_dir).is_ok() {
-                trace!("hidden-hoist: {}", pkg.name);
-                return Ok(());
-            }
             if reconcile_dir_link(&target_dir, &rel_target)? {
                 return Ok(());
             }
