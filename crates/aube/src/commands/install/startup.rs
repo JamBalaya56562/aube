@@ -78,7 +78,11 @@ pub(super) fn try_install_fast_path(
         && ((!opts.ignore_scripts && !aube_settings::resolved::ignore_scripts(&ctx))
             || !aube_settings::resolved::lockfile(&ctx)
             || aube_settings::resolved::lockfile_dir(&ctx).is_some()
-            || aube_lockfile::detect_existing_lockfile_kind(cwd).is_none()
+            || aube_lockfile::detect_existing_lockfile_kind_selecting(
+                cwd,
+                crate::commands::selected_lockfile_kind_with_ctx(&ctx)?,
+            )
+            .is_none()
             || aube_workspace::is_workspace_project_root(cwd)
             || crate::patches::load_declared_patch_paths(cwd)
                 .map_or(true, |patches| !patches.is_empty()))
@@ -100,7 +104,7 @@ pub(super) fn try_install_fast_path(
         .map(|packages| packages.len())
         .or_else(|| {
             let manifest = super::super::load_manifest_or_default(cwd).ok()?;
-            aube_lockfile::parse_lockfile_with_kind(cwd, &manifest)
+            crate::commands::parse_lockfile_with_kind(cwd, &manifest)
                 .ok()
                 .map(|(graph, _)| graph.packages.len())
         })
@@ -241,49 +245,47 @@ pub(super) fn merge_branch_lockfiles_if_needed(
         return Ok(());
     }
 
-    match aube_lockfile::merge_branch_lockfiles(cwd, manifest) {
-        Ok(report) => {
-            if !report.merged_files.is_empty() {
-                let filenames: Vec<String> = report
-                    .merged_files
-                    .iter()
-                    .filter_map(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|s| s.to_string())
-                    })
-                    .collect();
-                tracing::info!(
-                    "merged {} branch lockfile(s) into aube-lock.yaml: {}",
-                    report.merged_files.len(),
-                    filenames.join(", ")
-                );
-                if !report.conflicts.is_empty() {
-                    super::control::output(
-                        super::InstallOutputLevel::Warning,
-                        None,
-                        format!(
-                            "{} conflict(s) resolved during branch-lockfile merge:",
-                            report.conflicts.len()
-                        ),
-                    );
-                    for c in &report.conflicts {
-                        super::control::output(
-                            super::InstallOutputLevel::Warning,
-                            None,
-                            format!("  {c}"),
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    "branch-lockfile merge triggered but no aube-lock.*.yaml files were found"
-                );
+    let selected = crate::commands::selected_lockfile_kind_with_ctx(settings_ctx)?;
+    let kind =
+        selected.unwrap_or_else(|| aube_lockfile::merge::branch_lockfile_kind_for_merge(cwd));
+    let report = aube_lockfile::merge::merge_branch_lockfiles_as(cwd, manifest, kind)
+        .map_err(|err| miette!("failed to merge branch lockfiles: {err}"))?;
+    if !report.merged_files.is_empty() {
+        let filenames: Vec<String> = report
+            .merged_files
+            .iter()
+            .filter_map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        tracing::info!(
+            "merged {} branch lockfile(s) into {}: {}",
+            report.merged_files.len(),
+            kind.filename(),
+            filenames.join(", ")
+        );
+        if !report.conflicts.is_empty() {
+            super::control::output(
+                super::InstallOutputLevel::Warning,
+                None,
+                format!(
+                    "{} conflict(s) resolved during branch-lockfile merge:",
+                    report.conflicts.len()
+                ),
+            );
+            for c in &report.conflicts {
+                super::control::output(super::InstallOutputLevel::Warning, None, format!("  {c}"));
             }
-            Ok(())
         }
-        Err(err) => Err(miette!("failed to merge branch lockfiles: {err}")),
+    } else {
+        tracing::debug!(
+            "branch-lockfile merge triggered but no {} branch files were found",
+            kind.filename()
+        );
     }
+    Ok(())
 }
 
 pub(super) fn warn_accepted_noop_install_settings(settings_ctx: &aube_settings::ResolveCtx<'_>) {
