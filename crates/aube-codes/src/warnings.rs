@@ -283,7 +283,7 @@ pub const ALL: &[CodeMeta] = &[
     CodeMeta {
         name: WARN_AUBE_GVS_REDIRECTED,
         category: category::INSTALL_LIFECYCLE,
-        description: "On Windows, the global virtual store would land in a packaged (MSIX) app's redirected AppData, where Node can't follow its links; installed per-project instead.",
+        description: "On Windows, the global virtual store would land in a packaged (MSIX) app's redirected AppData, where Node can't follow its links; installed per-project instead, or kept anyway when enableGlobalVirtualStore is set explicitly.",
         exit_code: None,
     },
     CodeMeta {

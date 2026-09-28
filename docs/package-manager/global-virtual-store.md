@@ -231,3 +231,7 @@ such a redirected folder, aube installs per-project instead and warns
 (`WARN_AUBE_GVS_REDIRECTED`). To keep the global virtual store, point
 `globalVirtualStoreDir` at a directory outside AppData. To silence the warning,
 set `enableGlobalVirtualStore=false`.
+
+When `enableGlobalVirtualStore=true` is set explicitly, aube keeps the global
+virtual store there and prints the same warning, since the install would
+otherwise succeed and packages would only fail to resolve at runtime.

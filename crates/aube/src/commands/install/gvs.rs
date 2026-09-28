@@ -9,6 +9,25 @@ pub(super) fn resolve_global_virtual_store_override(
     env_snapshot: &[(String, String)],
 ) -> Option<bool> {
     let explicit = aube_settings::resolved::enable_global_virtual_store(settings_ctx);
+    // An explicit opt-in is honored even where MSIX redirects the store,
+    // but the install would otherwise look fine and only fail at runtime.
+    if explicit == Some(true)
+        && let Some(package) = msix_redirecting_package(
+            &crate::commands::global_virtual_store_dir_with_ctx(cwd, settings_ctx),
+        )
+    {
+        tracing::warn!(
+            code = aube_codes::warnings::WARN_AUBE_GVS_REDIRECTED,
+            "`enableGlobalVirtualStore` is set, so aube keeps the global virtual \
+             store, but it is redirected into the private storage of the packaged \
+             app `{package}` (MSIX file system virtualization), where Node can't \
+             follow its links and other programs can't see it — installed \
+             packages may fail to resolve their dependencies. Set \
+             `globalVirtualStoreDir` to a directory outside AppData, or unset \
+             `enableGlobalVirtualStore` to let aube install per-project here. \
+             Details: https://aube.sh/package-manager/global-virtual-store"
+        );
+    }
     explicit.or_else(|| {
         let triggers =
             aube_settings::resolved::disable_global_virtual_store_for_packages(settings_ctx);
