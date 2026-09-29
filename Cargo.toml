@@ -5,7 +5,7 @@ resolver = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "debuginfo"
+strip = "symbols"
 panic = "abort"
 
 [profile.release-native]
@@ -16,12 +16,15 @@ lto = "fat"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+# BOLT needs symbols in the phase 3b input; pgo.bash strips the final output.
+strip = "debuginfo"
 
 # Node-API addons execute inside the host process, so panics must unwind to
 # the napi-rs boundary instead of aborting the entire JavaScript runtime.
 [profile.napi]
 inherits = "release"
 panic = "unwind"
+strip = "debuginfo"
 
 # C ABI calls execute inside the host process and catch every panic at the
 # extern boundary. The workspace release profile's panic=abort would bypass
@@ -29,6 +32,7 @@ panic = "unwind"
 [profile.ffi]
 inherits = "release"
 panic = "unwind"
+strip = "debuginfo"
 
 [workspace.package]
 version = "2.6.0"
