@@ -736,6 +736,24 @@ impl Linker {
             &mut placements,
         )?;
 
+        // A placed package can depend on a workspace package too (the
+        // workspace peer of a `file:` package). It may have been hoisted
+        // to a directory the sibling's importer link does not cover, so
+        // link the sibling inside the package's own `node_modules`.
+        for (owner, _, name, ws_dir) in workspace_sibling_edges(graph, workspace_dirs) {
+            crate::validate_package_link_name(name)?;
+            for pkg_dir in placements.all_package_dirs(owner) {
+                let link_path = pkg_dir.join("node_modules").join(name);
+                // `link_path` always has a parent: it sits below `pkg_dir`.
+                let link_parent = link_path.parent().unwrap_or(pkg_dir);
+                mkdirp(link_parent)?;
+                try_remove_entry(&link_path);
+                let target = pathdiff::diff_paths(ws_dir, link_parent).unwrap_or(ws_dir.clone());
+                sys::create_dir_link(&target, &link_path)
+                    .map_err(|e| Error::Io(link_path.clone(), e))?;
+            }
+        }
+
         // Drop workspace deps in as symlinks, same as isolated mode.
         for (importer_path, deps) in &graph.importers {
             if !is_physical_importer(importer_path) {
@@ -833,7 +851,15 @@ impl Linker {
             );
         }
 
-        let nested_link_targets = build_nested_link_targets(&root_dir, graph);
+        let nested_link_targets =
+            build_workspace_nested_link_targets(&root_dir, graph, workspace_dirs);
+        let mut workspace_peer_links: BTreeMap<&str, Vec<(&str, &PathBuf)>> = BTreeMap::new();
+        for (owner, _, name, ws_dir) in workspace_sibling_edges(graph, workspace_dirs) {
+            workspace_peer_links
+                .entry(owner)
+                .or_default()
+                .push((name, ws_dir));
+        }
 
         // Step 1a: Materialize local (`file:` dir/tarball, `portal:`,
         // `exec:`) packages straight into the shared per-project
@@ -891,6 +917,23 @@ impl Linker {
                 }
             }
             if aube_entry.exists() {
+                // A cached `file:` tarball entry keeps the workspace peer
+                // link it was written with, which dangles once the workspace
+                // package moves. Repoint just those links.
+                for (name, ws_dir) in workspace_peer_links
+                    .get(dep_path.as_str())
+                    .into_iter()
+                    .flatten()
+                {
+                    let link_path = aube_entry.join("node_modules").join(name);
+                    if !reconcile_dir_link(&link_path, ws_dir)? {
+                        if let Some(parent) = link_path.parent() {
+                            mkdirp(parent)?;
+                        }
+                        sys::create_dir_link(ws_dir, &link_path)
+                            .map_err(|e| Error::Io(link_path.clone(), e))?;
+                    }
+                }
                 stats.packages_cached += 1;
                 continue;
             }
@@ -1715,7 +1758,20 @@ pub fn build_nested_link_targets(
     project_dir: &Path,
     graph: &LockfileGraph,
 ) -> Option<BTreeMap<String, PathBuf>> {
-    let map: BTreeMap<String, PathBuf> = graph
+    build_workspace_nested_link_targets(project_dir, graph, &BTreeMap::new())
+}
+
+/// [`build_nested_link_targets`] plus every workspace package that a
+/// per-project local package (for example a `file:` directory) depends on
+/// without a `packages:` entry of its own. The resolver records only a
+/// `DirectDep` for workspace siblings, so such an edge has no other way to
+/// find its directory.
+pub fn build_workspace_nested_link_targets(
+    project_dir: &Path,
+    graph: &LockfileGraph,
+    workspace_dirs: &BTreeMap<String, PathBuf>,
+) -> Option<BTreeMap<String, PathBuf>> {
+    let mut map: BTreeMap<String, PathBuf> = graph
         .packages
         .iter()
         .filter_map(|(dp, pkg)| match pkg.local_source.as_ref() {
@@ -1723,7 +1779,44 @@ pub fn build_nested_link_targets(
             _ => None,
         })
         .collect();
+    for (_, key, _, dir) in workspace_sibling_edges(graph, workspace_dirs) {
+        map.insert(key, dir.clone());
+    }
     if map.is_empty() { None } else { Some(map) }
+}
+
+/// Dependency edges of per-project local packages whose target is a
+/// workspace package with no `packages:` entry:
+/// `(owner dep_path, target dep_path, name, workspace dir)`. Registry, git
+/// and tarball packages are excluded: they can live in the global virtual
+/// store, where a project-specific workspace directory must not be baked
+/// into an entry other projects share.
+fn workspace_sibling_edges<'a>(
+    graph: &'a LockfileGraph,
+    workspace_dirs: &'a BTreeMap<String, PathBuf>,
+) -> impl Iterator<Item = (&'a str, String, &'a str, &'a PathBuf)> {
+    graph
+        .packages
+        .iter()
+        .filter(|(_, pkg)| {
+            !workspace_dirs.is_empty()
+                && pkg
+                    .local_source
+                    .as_ref()
+                    .is_some_and(|local| !local.is_globally_shareable())
+        })
+        .flat_map(move |(owner, pkg)| {
+            pkg.dependencies.iter().filter_map(move |(name, tail)| {
+                let dir = workspace_dirs.get(name)?;
+                let key = format!("{name}@{tail}");
+                (!graph.packages.contains_key(&key)).then_some((
+                    owner.as_str(),
+                    key,
+                    name.as_str(),
+                    dir,
+                ))
+            })
+        })
 }
 
 /// The dependency links of a global virtual-store entry that are safe to
