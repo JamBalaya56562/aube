@@ -927,6 +927,174 @@ pub(crate) fn link_all_bins(input: LinkAllBinsInput<'_>) -> miette::Result<Manag
     Ok(managed)
 }
 
+/// Remove shims aube wrote for commands the current graph no longer claims.
+///
+/// `.bin/` is otherwise append-only, so a dependency removed from the
+/// manifest keeps its shim, which then points at a package that is gone
+/// (or about to be swept from the virtual store) and shadows any
+/// same-named executable further down `PATH`. Only aube-authored
+/// launchers are touched; files a lifecycle script or the user put there
+/// are left alone. Must run after a full linking pass so `managed.seen`
+/// holds every command this install claims.
+pub(crate) fn remove_unclaimed_bin_links(
+    project_dir: &Path,
+    modules_dir_name: &str,
+    aube_dir: &Path,
+    graph: &aube_lockfile::LockfileGraph,
+    managed: &ManagedBinLinks,
+) -> miette::Result<()> {
+    let aube_dir = aube_util::path::normalize_lexical(aube_dir);
+    let mut bin_dirs = BTreeSet::from([project_dir.join(modules_dir_name).join(".bin")]);
+    // A workspace dependency's native executable is linked from its own
+    // package directory, outside the virtual store and `node_modules`.
+    let mut workspace_dirs = Vec::new();
+    for importer_path in graph.importers.keys() {
+        if importer_path != "." && aube_linker::is_physical_importer(importer_path) {
+            workspace_dirs.push(aube_util::path::normalize_lexical(
+                &project_dir.join(importer_path),
+            ));
+            bin_dirs.insert(
+                project_dir
+                    .join(importer_path)
+                    .join(modules_dir_name)
+                    .join(".bin"),
+            );
+        }
+    }
+    for bin_dir in bin_dirs {
+        let claimed = managed.seen.get(&bin_dir);
+        let modules_dir = aube_util::path::normalize_lexical(bin_dir.parent().unwrap_or(&bin_dir));
+        let launcher_roots: Vec<&Path> = [aube_dir.as_path(), modules_dir.as_path()]
+            .into_iter()
+            .chain(workspace_dirs.iter().map(PathBuf::as_path))
+            .collect();
+        let mut stale = Vec::new();
+        for (path, name) in list_bin_entries(&bin_dir)? {
+            if is_unclaimed_aube_bin_link(
+                &path,
+                &name,
+                claimed,
+                (&aube_dir, &modules_dir),
+                &launcher_roots,
+            ) {
+                stale.push(path);
+            }
+        }
+        for path in stale {
+            tracing::debug!("removing unclaimed bin shim {}", path.display());
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).into_diagnostic().wrap_err_with(|| {
+                        format!("failed to remove stale bin shim {}", path.display())
+                    });
+                }
+            }
+            if let Some(parent) = path.parent()
+                && parent != bin_dir
+            {
+                // Best effort: only succeeds once the scope directory is empty.
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every command launcher directly in `bin_dir`, plus one level under
+/// `@scope/` directories, as `(path, command name)`. Scope directories are
+/// only descended when they are real directories: a symlinked `@scope` is
+/// not aube's to walk.
+fn list_bin_entries(bin_dir: &Path) -> miette::Result<Vec<(PathBuf, String)>> {
+    let entries = match std::fs::read_dir(bin_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(e)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", bin_dir.display()));
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.into_diagnostic()?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let file_type = entry.file_type().into_diagnostic()?;
+        let is_real_dir = file_type.is_dir();
+        // A symlinked `@scope` is a directory link, not a command, and
+        // removing it would take every command beneath it away.
+        // A bare `@tool` command can be a symlink too, so only skip links
+        // that actually resolve to a directory.
+        if file_name.starts_with('@') && file_type.is_symlink() && entry.path().is_dir() {
+            continue;
+        }
+        if file_name.starts_with('@') && is_real_dir {
+            let scope_dir = entry.path();
+            for inner in std::fs::read_dir(&scope_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", scope_dir.display()))?
+            {
+                let inner = inner.into_diagnostic()?;
+                let name = format!("{file_name}/{}", inner.file_name().to_string_lossy());
+                out.push((inner.path(), name));
+            }
+        } else {
+            out.push((entry.path(), file_name));
+        }
+    }
+    Ok(out)
+}
+
+/// The command a Windows `.cmd` / `.ps1` launcher belongs to.
+fn windows_launcher_stem(file_name: &str) -> Option<&str> {
+    if !cfg!(windows) {
+        return None;
+    }
+    file_name
+        .strip_suffix(".cmd")
+        .or_else(|| file_name.strip_suffix(".ps1"))
+}
+
+fn is_unclaimed_aube_bin_link(
+    path: &Path,
+    name: &str,
+    claimed: Option<&BTreeSet<String>>,
+    (aube_dir, modules_dir): (&Path, &Path),
+    launcher_roots: &[&Path],
+) -> bool {
+    // A command literally named `foo.cmd` is recorded under that name, so
+    // check the file's own name before falling back to its command stem.
+    if claimed.is_some_and(|names| {
+        names.contains(name) || windows_launcher_stem(name).is_some_and(|s| names.contains(s))
+    }) {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        let Ok(target) = std::fs::read_link(path) else {
+            return false;
+        };
+        let resolved = aube_util::path::normalize_lexical(
+            &path.parent().unwrap_or(Path::new("")).join(target),
+        );
+        // A live link into the virtual store is aube's private layout. A
+        // dangling link is also ours when it points into the importer's
+        // `node_modules`, where hoisted installs link bins and the
+        // package has since been swept. Anything else, or a live link
+        // someone aimed at a file under `node_modules`, is not aube's.
+        return resolved.starts_with(aube_dir)
+            || (resolved.starts_with(modules_dir) && !path.exists());
+    }
+    if cfg!(windows) {
+        return aube_linker::sys::is_generated_windows_launcher(path, launcher_roots)
+            .unwrap_or(false);
+    }
+    matches!(aube_linker::sys::resolve_bin_shim(path), Ok(Some(_)))
+}
+
 /// Remove only shims that still match entries created by the pre-build pass.
 /// Lifecycle-produced files or retargeted symlinks are left untouched.
 pub(crate) fn remove_managed_bin_links(
@@ -1286,6 +1454,135 @@ mod tests {
             bin,
             ..Default::default()
         }
+    }
+
+    /// A shim left behind by a removed dependency must go, while shims the
+    /// current install claims and files aube did not write stay put.
+    #[test]
+    fn remove_unclaimed_bin_links_drops_only_stale_aube_shims() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let aube_dir = project.join("node_modules/.aube");
+        let bin_dir = project.join("node_modules/.bin");
+        let pkg_dir = aube_dir.join("gone@1.0.0/node_modules/gone");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let tool = pkg_dir.join("tool.js");
+        std::fs::write(&tool, "#!/usr/bin/env node\n").unwrap();
+
+        let opts = aube_linker::BinShimOptions {
+            prefer_symlinked_executables: Some(false),
+            ..Default::default()
+        };
+        let mut previous = ManagedBinLinks::default();
+        for name in ["gone", "kept"] {
+            create_bin_link(
+                &bin_dir,
+                name,
+                &tool,
+                opts,
+                &mut previous,
+                None,
+                BinConflict::Overwrite,
+            )
+            .unwrap();
+        }
+        std::fs::write(bin_dir.join("foreign"), "#!/bin/sh\necho hi\n").unwrap();
+
+        let mut current = ManagedBinLinks::default();
+        current
+            .seen
+            .entry(bin_dir.clone())
+            .or_default()
+            .insert("kept".to_string());
+        let graph = LockfileGraph::default();
+        remove_unclaimed_bin_links(project, "node_modules", &aube_dir, &graph, &current).unwrap();
+
+        assert!(!bin_dir.join("gone").exists(), "stale shim is removed");
+        assert!(bin_dir.join("kept").exists(), "claimed shim stays");
+        assert!(
+            bin_dir.join("foreign").exists(),
+            "a file aube did not write stays"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_unclaimed_bin_links_drops_dangling_and_virtual_store_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let aube_dir = project.join("node_modules/.aube");
+        let bin_dir = project.join("node_modules/.bin");
+        let live = aube_dir.join("gone@1.0.0/node_modules/gone/tool.js");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, "").unwrap();
+        let outside = project.join("outside.js");
+        std::fs::write(&outside, "").unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink(
+            "../.aube/gone@1.0.0/node_modules/gone/tool.js",
+            bin_dir.join("gone"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../.aube/gone@1.0.0/node_modules/gone/tool.js",
+            bin_dir.join("@tool"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../hoisted/x.js", bin_dir.join("dangling")).unwrap();
+        std::os::unix::fs::symlink("../../outside.js", bin_dir.join("user")).unwrap();
+        std::os::unix::fs::symlink("../../missing.js", bin_dir.join("foreign_dangling")).unwrap();
+
+        remove_unclaimed_bin_links(
+            project,
+            "node_modules",
+            &aube_dir,
+            &LockfileGraph::default(),
+            &ManagedBinLinks::default(),
+        )
+        .unwrap();
+
+        assert!(bin_dir.join("gone").symlink_metadata().is_err());
+        assert!(
+            bin_dir.join("@tool").symlink_metadata().is_err(),
+            "a bare `@`-prefixed command is not a scope directory"
+        );
+        assert!(bin_dir.join("dangling").symlink_metadata().is_err());
+        assert!(bin_dir.join("user").symlink_metadata().is_ok());
+        assert!(
+            bin_dir.join("foreign_dangling").symlink_metadata().is_ok(),
+            "a dangling symlink aube did not point into node_modules is not ours"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_unclaimed_bin_links_does_not_walk_a_symlinked_scope_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let aube_dir = project.join("node_modules/.aube");
+        let bin_dir = project.join("node_modules/.bin");
+        let elsewhere = project.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink("../.aube/gone/x.js", elsewhere.join("tool")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, bin_dir.join("@scope")).unwrap();
+        std::fs::create_dir_all(aube_dir.join("@vs")).unwrap();
+        std::os::unix::fs::symlink("../.aube/@vs", bin_dir.join("@inside")).unwrap();
+
+        remove_unclaimed_bin_links(
+            project,
+            "node_modules",
+            &aube_dir,
+            &LockfileGraph::default(),
+            &ManagedBinLinks::default(),
+        )
+        .unwrap();
+
+        assert!(elsewhere.join("tool").symlink_metadata().is_ok());
+        assert!(
+            bin_dir.join("@inside").symlink_metadata().is_ok(),
+            "a scope link into the virtual store is not a stale command"
+        );
     }
 
     /// The hoisted transitive pass links every package's bins into the
