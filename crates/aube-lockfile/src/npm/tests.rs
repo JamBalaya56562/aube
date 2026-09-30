@@ -2364,3 +2364,32 @@ fn workspace_member_required_peers_are_direct_deps() {
     );
     assert!(written["packages"][""].get("dependencies").is_none());
 }
+
+/// npm writes a workspace member whose package.json has no `version` as
+/// an empty entry. Reading it must not fail.
+#[test]
+fn test_parse_workspace_member_without_version() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "root",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": {
+                    "name": "root",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/app": {
+                    "resolved": "packages/app",
+                    "link": true
+                },
+                "packages/app": {}
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let dep_path = LocalSource::Link(PathBuf::from("packages/app")).dep_path("app");
+    assert_eq!(graph.packages[&dep_path].version, "0.0.0");
+    assert!(graph.importers.contains_key("packages/app"));
+}

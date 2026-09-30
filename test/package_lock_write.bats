@@ -149,6 +149,37 @@ teardown() {
 	assert_success
 }
 
+@test "aube install reads an npm workspace member that has no version" {
+	mkdir -p packages/app
+	echo '{"name":"root","private":true,"workspaces":["packages/*"]}' >package.json
+	echo '{"name":"app"}' >packages/app/package.json
+	# npm 11 writes a member without a version as an empty entry.
+	cat >package-lock.json <<'EOF'
+{
+  "name": "root",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "root",
+      "workspaces": [
+        "packages/*"
+      ]
+    },
+    "node_modules/app": {
+      "resolved": "packages/app",
+      "link": true
+    },
+    "packages/app": {}
+  }
+}
+EOF
+
+	run aube install --frozen-lockfile
+	assert_success
+	assert_link_exists node_modules/app
+}
+
 @test "aube add preserves existing pnpm-lock.yaml" {
 	cp "$PROJECT_ROOT/fixtures/basic/package.json" .
 	cp "$PROJECT_ROOT/fixtures/basic/pnpm-lock.yaml" .
