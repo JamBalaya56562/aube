@@ -232,6 +232,39 @@ JSON
 	assert_output --partial "is-odd 3.0.1"
 }
 
+@test "aube install and aube list show a workspace dep's version" {
+	cat >pnpm-workspace.yaml <<'YAML'
+packages:
+  - packages/*
+YAML
+	cat >package.json <<'JSON'
+{ "name": "root", "private": true, "dependencies": { "lib": "workspace:*" } }
+JSON
+	mkdir -p packages/lib
+	cat >packages/lib/package.json <<'JSON'
+{ "name": "lib", "version": "1.4.0" }
+JSON
+
+	run aube install
+	assert_success
+	assert_output --partial "+ lib@1.4.0"
+	refute_output --partial "lib@?"
+
+	run aube list
+	assert_success
+	assert_output --partial "lib 1.4.0"
+
+	run aube list --parseable
+	assert_success
+	assert_output --partial "$(printf 'lib@1.4.0\tlib\t1.4.0')"
+
+	run aube list --json
+	assert_success
+	echo "$output" | node -e '
+const [project] = JSON.parse(require("fs").readFileSync(0, "utf8"));
+if (project.dependencies.lib.version !== "1.4.0") process.exit(1);'
+}
+
 @test "aube list without a lockfile prints a friendly message" {
 	echo '{"name":"empty","version":"1.0.0"}' >package.json
 	run aube list

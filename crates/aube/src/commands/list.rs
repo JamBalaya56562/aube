@@ -677,7 +677,7 @@ fn render_section(
         let is_last = i == last_idx;
         let connector = if is_last { "└── " } else { "├── " };
         let pkg = graph.get_package(&dep.dep_path);
-        let version = pkg.map(|p| p.version.as_str()).unwrap_or("?");
+        let version = graph.direct_dep_version(dep).unwrap_or("?");
         let name = if sanitize_tree {
             aube_util::terminal::sanitize_inline(&dep.name)
         } else {
@@ -903,10 +903,10 @@ fn build_json_deps(
     for dep in roots {
         let pkg = graph.get_package(&dep.dep_path);
         let mut entry = serde_json::Map::new();
-        if let Some(pkg) = pkg {
+        if let Some(version) = graph.direct_dep_version(dep) {
             entry.insert(
                 "version".to_string(),
-                serde_json::Value::String(pkg.version.clone()),
+                serde_json::Value::String(version.to_string()),
             );
         }
         if args.depth.includes_transitive()
@@ -1011,6 +1011,11 @@ fn render_parseable_for_importer(
             if args.depth.includes_transitive() {
                 collect_transitive(graph, pkg, args.depth.max, 1, &mut out);
             }
+        } else if let Some(version) = graph.direct_dep_version(dep) {
+            out.insert(
+                dep.dep_path.clone(),
+                (dep.name.clone(), version.to_string()),
+            );
         }
     }
 
