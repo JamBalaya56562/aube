@@ -89,9 +89,30 @@ fn with_patch_hash(value: &str, hash: Option<&str>) -> String {
     )
 }
 
+/// Root-relative `path` re-expressed relative to workspace member
+/// `importer`, both root-relative, in forward-slash form. Both are anchored
+/// at `root`, the absolute project root, so an importer outside it
+/// (`../sibling`) gets a path back through the root's own directory name,
+/// as pnpm writes it. An absolute path means the same thing from anywhere
+/// and is kept, as is a path with no relative form from the importer.
+fn relative_to_importer(path: &Path, importer: &str, root: &Path) -> String {
+    let forward = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    if path.is_absolute() {
+        return forward(path);
+    }
+    let target = aube_util::path::normalize_lexical(&root.join(path));
+    let base = aube_util::path::normalize_lexical(&root.join(importer));
+    match pathdiff::diff_paths(&target, &base) {
+        Some(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Some(rel) => forward(&rel),
+        None => forward(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::with_patch_hash;
+    use super::{relative_to_importer, with_patch_hash};
+    use std::path::Path;
 
     #[test]
     fn replaces_every_stale_patch_hash_suffix() {
@@ -101,10 +122,49 @@ mod tests {
             "1.0.0(patch_hash=current)(react@19)"
         );
     }
+
+    #[test]
+    fn member_link_paths_become_member_relative() {
+        let root = Path::new("/ws/proj");
+        let rel =
+            |path: &str, importer: &str| relative_to_importer(Path::new(path), importer, root);
+        assert_eq!(rel("packages/a/vendor/x", "packages/a"), "vendor/x");
+        assert_eq!(rel("libs/y", "packages/a"), "../../libs/y");
+        assert_eq!(rel("../outside", "packages/a"), "../../../outside");
+        assert_eq!(rel("packages/a", "packages/a"), ".");
+        // An importer outside the root reaches a root target through the
+        // root's directory name.
+        assert_eq!(rel("vendor/x", "../sibling"), "../proj/vendor/x");
+        assert_eq!(rel("../sibling/vendor/x", "../sibling"), "vendor/x");
+    }
 }
 
-/// Write a LockfileGraph as pnpm-lock.yaml v9 format.
+/// Write a LockfileGraph as pnpm-lock.yaml v9 format to `path`, taking
+/// the lockfile's own directory as the project root. Only correct when the
+/// graph's importer keys and local paths are relative to that directory,
+/// as in a project lockfile. A copy written elsewhere, such as under
+/// `node_modules`, must use [`write_with_project_root`] with the real
+/// project root, or a member's `link:` versions point at the wrong
+/// directory. Kept for API compatibility; slated for removal in v3 (see
+/// `V3.md`).
 pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Result<(), Error> {
+    let lockfile_dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    write_with_project_root(path, lockfile_dir, graph, manifest)
+}
+
+/// Write a LockfileGraph as pnpm-lock.yaml v9 format to `path`.
+/// `project_root` is the directory the graph's importer keys and local
+/// paths are relative to: the lockfile's own directory for a project
+/// lockfile, but not for a copy kept under `node_modules`.
+pub fn write_with_project_root(
+    path: &Path,
+    project_root: &Path,
+    graph: &LockfileGraph,
+    manifest: &PackageJson,
+) -> Result<(), Error> {
     let native_pnpm_aliases = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -114,6 +174,11 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
     // package serializes differently depending on whether the graph
     // came from a parse or a fresh resolve.
     let patch_hashes = pnpm_patch_hashes(path, &graph.patched_dependencies)?;
+    // Member `link:` versions are written relative to the member; anchoring
+    // both at the absolute project root lets an importer outside it reach
+    // a target inside it.
+    let project_root =
+        std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let patch_hash_for = |pkg: &crate::LockedPackage| -> Option<&str> {
         patch_hashes
             .get(&pkg.spec_key())
@@ -202,7 +267,20 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 .get(&dep.dep_path)
                 .and_then(|p| p.local_source.as_ref())
             {
-                local.specifier()
+                match local {
+                    // pnpm records a member's `link:` relative to the
+                    // member, a target an override set included; the graph
+                    // keeps it relative to the root.
+                    LocalSource::Link(path)
+                        if importer_path != "." && specifier.starts_with("link:") =>
+                    {
+                        format!(
+                            "link:{}",
+                            relative_to_importer(path, importer_path, &project_root)
+                        )
+                    }
+                    _ => local.specifier(),
+                }
             } else if native_pnpm_aliases
                 && let Some(pkg) = graph.packages.get(&dep.dep_path)
                 && let Some(real_name) = pkg.alias_of.as_deref()
