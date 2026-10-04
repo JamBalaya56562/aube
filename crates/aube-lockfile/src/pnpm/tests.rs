@@ -1245,6 +1245,98 @@ fn git_tarball_peer_suffix_renders_as_spec_and_round_trips() {
 }
 
 #[test]
+fn nested_contextual_git_tarball_peers_keep_source_urls() {
+    let core = LocalSource::RemoteTarball(crate::RemoteTarballSource {
+        url: "https://example.com/core.tgz".to_string(),
+        integrity: "sha512-core".to_string(),
+        git_hosted: false,
+    });
+    let sources = [
+        LocalSource::RemoteTarball(crate::RemoteTarballSource {
+            url: "https://example.com/adapter.tgz".to_string(),
+            integrity: "sha512-adapter".to_string(),
+            git_hosted: false,
+        }),
+        LocalSource::Git(GitSource {
+            url: "https://example.com/adapter.git".to_string(),
+            committish: None,
+            resolved: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+            integrity: None,
+            subpath: None,
+        }),
+    ];
+    for adapter in sources {
+        let core_key = core.dep_path("core");
+        let adapter_head = adapter.dep_path("adapter");
+        let adapter_key = format!("{adapter_head}({core_key})");
+        let consumer_key = format!("consumer@1.0.0({adapter_key})");
+        // The transitive adapter exists only with a peer context, so looking
+        // it up by the flat head alone cannot recover its source.
+        let graph = LockfileGraph {
+            packages: [
+                LockedPackage {
+                    name: "core".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: core_key.clone(),
+                    local_source: Some(core.clone()),
+                    ..Default::default()
+                },
+                LockedPackage {
+                    name: "adapter".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: adapter_key,
+                    local_source: Some(adapter.clone()),
+                    ..Default::default()
+                },
+                LockedPackage {
+                    name: "consumer".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: consumer_key.clone(),
+                    ..Default::default()
+                },
+            ]
+            .into_iter()
+            .map(|pkg| (pkg.dep_path.clone(), pkg))
+            .collect(),
+            importers: BTreeMap::from([(
+                ".".to_string(),
+                vec![DirectDep {
+                    name: "consumer".to_string(),
+                    dep_path: consumer_key,
+                    dep_type: DepType::Production,
+                    specifier: Some("1.0.0".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        assert!(!graph.packages.contains_key(&adapter_head));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-lock.yaml");
+        let expected = format!(
+            "1.0.0(adapter@{}(core@{}))",
+            adapter.specifier(),
+            core.specifier()
+        );
+        write_with_project_root(&path, dir.path(), &graph, &PackageJson::default()).unwrap();
+        for _ in 0..2 {
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                written.contains(&format!("version: {expected}")),
+                "{written}"
+            );
+            assert!(
+                written.contains(&format!("consumer@{expected}:")),
+                "{written}"
+            );
+            assert!(!written.contains(&adapter_head), "{written}");
+            assert!(!written.contains(&core_key), "{written}");
+            let reparsed = parse(&path).unwrap();
+            write_with_project_root(&path, dir.path(), &reparsed, &PackageJson::default()).unwrap();
+        }
+    }
+}
+
+#[test]
 fn direct_url_importer_strips_peer_suffix_from_fetch_url() {
     // Regression: when a direct dep's importer `version:` is a
     // tarball URL *with* a pnpm peer-context suffix
@@ -3377,6 +3469,79 @@ snapshots:
         3,
         "stored patch hashes must decorate every reference without the patch file:\n{rewritten}"
     );
+}
+
+#[test]
+fn pnpm_patched_peers_keep_hashes_in_nested_and_alias_references() {
+    let yaml = r#"lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      consumer:
+        specifier: 1.0.0
+        version: 1.0.0(@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale)))
+      wrapper-alias:
+        specifier: npm:@scope/wrapper@1.0.0
+        version: '@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))'
+packages:
+  consumer@1.0.0: {}
+  '@scope/wrapper@1.0.0':
+    peerDependencies:
+      react: '*'
+  react@19.0.0: {}
+snapshots:
+  consumer@1.0.0(@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))):
+    dependencies:
+      wrapper-alias: '@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))'
+    optionalDependencies:
+      wrapper: '@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))'
+  '@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))':
+    dependencies:
+      react: 19.0.0(patch_hash=stale)
+  react@19.0.0(patch_hash=stale): {}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let mut graph = parse(&path).unwrap();
+    let hash = "2751a3a2f303ad21752038085e2b8c5f98ecff61a2e4ebbd43506a941725be80";
+    graph.patched_dependencies = ["consumer@1.0.0", "@scope/wrapper@1.0.0", "react@19.0.0"]
+        .into_iter()
+        .map(|name| (name.to_string(), hash.to_string()))
+        .collect();
+    write_with_project_root(&path, dir.path(), &graph, &PackageJson::default()).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    let raw: yaml_serde::Value = yaml_serde::from_str(&written).unwrap();
+    let react = format!("19.0.0(patch_hash={hash})");
+    let wrapper = format!("1.0.0(patch_hash={hash})(react@{react})");
+    let consumer = format!("1.0.0(patch_hash={hash})(@scope/wrapper@{wrapper})");
+    assert_eq!(
+        raw["importers"]["."]["dependencies"]["consumer"]["version"],
+        consumer
+    );
+    assert_eq!(
+        raw["importers"]["."]["dependencies"]["wrapper-alias"]["version"],
+        format!("@scope/wrapper@{wrapper}")
+    );
+    let snapshot = &raw["snapshots"][format!("consumer@{consumer}")];
+    assert_eq!(
+        snapshot["dependencies"]["wrapper-alias"],
+        format!("@scope/wrapper@{wrapper}")
+    );
+    assert_eq!(
+        snapshot["optionalDependencies"]["wrapper"],
+        format!("@scope/wrapper@{wrapper}")
+    );
+    assert_eq!(
+        raw["snapshots"][format!("@scope/wrapper@{wrapper}")]["dependencies"]["react"],
+        react
+    );
+    assert!(!written.contains("patch_hash=stale"), "{written}");
+
+    // Parsing and writing again must retain every nested hash, with no patch files.
+    let reparsed = parse(&path).unwrap();
+    write_with_project_root(&path, dir.path(), &reparsed, &PackageJson::default()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
 }
 
 #[test]
