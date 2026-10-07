@@ -5,7 +5,7 @@ use crate::{
     DepType, DirectDep, DriftStatus, Error, GitSource, LocalSource, LockedPackage, LockfileGraph,
     LockfileKind,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -2418,6 +2418,120 @@ fn workspace_member_required_peers_are_direct_deps() {
         serde_json::json!({ "kind-of": "^6.0.0" })
     );
     assert!(written["packages"][""].get("dependencies").is_none());
+}
+
+/// npm records the target of every `file:` dep as an importer, including
+/// ones a workspace member declares. Given their manifests, as the install
+/// passes them, the drift check accepts those importers and compares their
+/// dependencies like a project's.
+#[test]
+fn test_drift_checks_file_dep_importers_of_workspace_members() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    // What npm 11 writes for a member depending on `file:./vendor/x`,
+    // which in turn depends on `file:../y`.
+    std::fs::write(
+        tmp.path(),
+        r#"
+{
+  "name": "root",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "root",
+      "workspaces": [
+        "packages/*"
+      ]
+    },
+    "node_modules/app": {
+      "resolved": "packages/app",
+      "link": true
+    },
+    "node_modules/x": {
+      "resolved": "packages/app/vendor/x",
+      "link": true
+    },
+    "node_modules/y": {
+      "resolved": "packages/app/vendor/y",
+      "link": true
+    },
+    "packages/app": {
+      "version": "1.0.0",
+      "dependencies": {
+        "x": "file:./vendor/x"
+      }
+    },
+    "packages/app/vendor/x": {
+      "version": "1.0.0",
+      "dependencies": {
+        "y": "file:../y"
+      }
+    },
+    "packages/app/vendor/y": {
+      "version": "1.0.0"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let graph = parse(tmp.path()).unwrap();
+    let root: aube_manifest::PackageJson =
+        serde_json::from_str(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#)
+            .unwrap();
+    let app: aube_manifest::PackageJson = serde_json::from_str(
+        r#"{"name":"app","version":"1.0.0","dependencies":{"x":"file:./vendor/x"}}"#,
+    )
+    .unwrap();
+    let members = [(".".to_string(), root), ("packages/app".to_string(), app)];
+    let check = |targets: &[(String, aube_manifest::PackageJson)]| {
+        graph.check_drift_workspace_with_local_targets_for_kind(
+            &members,
+            targets,
+            &BTreeMap::new(),
+            &[],
+            &BTreeMap::new(),
+            true,
+            LockfileKind::Npm,
+        )
+    };
+
+    // The install reads the reachable `file:` targets' manifests from disk.
+    assert_eq!(
+        graph.npm_local_importers(&[".", "packages/app"]),
+        ["packages/app/vendor/x", "packages/app/vendor/y"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    let targets = |x_deps: &str| {
+        vec![
+            (
+                "packages/app/vendor/x".to_string(),
+                serde_json::from_str(&format!(
+                    r#"{{"name":"x","version":"1.0.0","dependencies":{x_deps}}}"#
+                ))
+                .unwrap(),
+            ),
+            (
+                "packages/app/vendor/y".to_string(),
+                serde_json::from_str(r#"{"name":"y","version":"1.0.0"}"#).unwrap(),
+            ),
+        ]
+    };
+
+    assert_eq!(check(&targets(r#"{"y":"file:../y"}"#)), DriftStatus::Fresh);
+    // A dependency added to a `file:` target is drift, as `npm ci` reports.
+    assert!(matches!(
+        check(&targets(r#"{"y":"file:../y","z":"^1.0.0"}"#)),
+        DriftStatus::Stale { reason } if reason.contains("packages/app/vendor/x")
+    ));
+    // Without the targets' manifests they read as projects that left.
+    assert!(matches!(
+        check(&[]),
+        DriftStatus::Stale { reason } if reason.contains("packages/app/vendor/")
+    ));
+    assert_eq!(graph.npm_local_importers(&["."]), BTreeSet::new());
 }
 
 /// npm writes a workspace member without a `version` in its package.json

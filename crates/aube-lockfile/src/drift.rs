@@ -94,6 +94,7 @@ impl LockfileGraph {
     ) -> DriftStatus {
         self.check_drift_workspace_with_options(
             manifests,
+            &[],
             workspace_overrides,
             workspace_ignored_optional,
             workspace_catalogs,
@@ -113,6 +114,34 @@ impl LockfileGraph {
     ) -> DriftStatus {
         self.check_drift_workspace_with_options(
             manifests,
+            &[],
+            workspace_overrides,
+            workspace_ignored_optional,
+            workspace_catalogs,
+            is_workspace_install,
+            kind_records_resolution_metadata(kind),
+        )
+    }
+
+    /// Like [`Self::check_drift_workspace_for_kind`], also checking the
+    /// `file:`/`link:` targets an npm lockfile records as importers (see
+    /// [`Self::npm_local_importers`]) against their own manifests, as
+    /// `npm ci` does. They count as part of the workspace, but are not
+    /// workspace members the root links.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_drift_workspace_with_local_targets_for_kind(
+        &self,
+        manifests: &[(String, aube_manifest::PackageJson)],
+        local_targets: &[(String, aube_manifest::PackageJson)],
+        workspace_overrides: &BTreeMap<String, String>,
+        workspace_ignored_optional: &[String],
+        workspace_catalogs: &BTreeMap<String, BTreeMap<String, String>>,
+        is_workspace_install: bool,
+        kind: LockfileKind,
+    ) -> DriftStatus {
+        self.check_drift_workspace_with_options(
+            manifests,
+            local_targets,
             workspace_overrides,
             workspace_ignored_optional,
             workspace_catalogs,
@@ -146,9 +175,11 @@ impl LockfileGraph {
         self.check_drift_for_importer(".", manifest, &effective)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_drift_workspace_with_options(
         &self,
         manifests: &[(String, aube_manifest::PackageJson)],
+        local_targets: &[(String, aube_manifest::PackageJson)],
         workspace_overrides: &BTreeMap<String, String>,
         workspace_ignored_optional: &[String],
         workspace_catalogs: &BTreeMap<String, BTreeMap<String, String>>,
@@ -179,12 +210,14 @@ impl LockfileGraph {
             }
             None => BTreeMap::new(),
         };
+        // Only workspace members: a local target's name is a dependency the
+        // root may declare, not a member npm links into the root.
         let workspace_link_names: std::collections::HashSet<&str> = manifests
             .iter()
             .filter(|(path, _)| path != ".")
             .filter_map(|(_, manifest)| manifest.name.as_deref())
             .collect();
-        for (importer_path, manifest) in manifests {
+        for (importer_path, manifest) in manifests.iter().chain(local_targets) {
             // pnpm-format lockfiles record every workspace project that
             // declares deps. A missing importer means the lockfile was
             // written without that project (the per-importer check below
@@ -227,10 +260,15 @@ impl LockfileGraph {
         // what tells us we're not in the npm `package-lock.json`
         // path, where the parser synthesizes importer entries for
         // every `file:` link and a manifest-shape gate would
-        // false-positive on legitimate single-package installs.
+        // false-positive on legitimate single-package installs. An npm
+        // workspace can still carry such `file:` importers; the caller
+        // passes their manifests as `local_targets`.
         if is_workspace_install {
-            let current_importers: std::collections::HashSet<&str> =
-                manifests.iter().map(|(p, _)| p.as_str()).collect();
+            let current_importers: std::collections::HashSet<&str> = manifests
+                .iter()
+                .chain(local_targets)
+                .map(|(p, _)| p.as_str())
+                .collect();
             for importer_path in self.importers.keys() {
                 if !current_importers.contains(importer_path.as_str()) {
                     return DriftStatus::Stale {
@@ -242,6 +280,40 @@ impl LockfileGraph {
             }
         }
         DriftStatus::Fresh
+    }
+
+    /// The lockfile importers, other than `projects` themselves, that
+    /// `projects` reach by a `file:` or `link:` path, directly or through
+    /// each other. The npm reader records the target of each such dep as
+    /// an importer; the caller checks their own `package.json` against
+    /// them like a workspace project's, as `npm ci` does.
+    pub fn npm_local_importers(&self, projects: &[&str]) -> BTreeSet<String> {
+        let mut reached: BTreeSet<String> = projects.iter().map(|p| p.to_string()).collect();
+        let mut queue: Vec<String> = reached.iter().cloned().collect();
+        while let Some(importer) = queue.pop() {
+            let Some(deps) = self.importers.get(&importer) else {
+                continue;
+            };
+            for spec in deps.iter().filter_map(|dep| dep.specifier.as_deref()) {
+                let Some(rel) = spec
+                    .strip_prefix("file:")
+                    .or_else(|| spec.strip_prefix("link:"))
+                else {
+                    continue;
+                };
+                let target =
+                    aube_util::path::normalize_lexical(&std::path::Path::new(&importer).join(rel))
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                if self.importers.contains_key(&target) && reached.insert(target.clone()) {
+                    queue.push(target);
+                }
+            }
+        }
+        for project in projects {
+            reached.remove(*project);
+        }
+        reached
     }
 
     fn resolution_metadata_drift_reason(
