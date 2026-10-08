@@ -40,6 +40,16 @@ pub fn write(
             continue;
         }
         canonical.entry(pkg.spec_key()).or_insert(pkg);
+        // The hoist tree looks packages up by their dep_path, which for
+        // `file:` packages carries the path hash instead of the version.
+        if matches!(
+            pkg.local_source,
+            Some(LocalSource::Directory(_) | LocalSource::Tarball(_))
+        ) {
+            canonical
+                .entry(crate::npm::canonical_key_from_dep_path(&pkg.dep_path))
+                .or_insert(pkg);
+        }
     }
 
     // Build the hoist tree from every importer's direct deps (not just
@@ -230,6 +240,7 @@ pub fn write(
                 .declared_dependencies
                 .get(dep_name)
                 .cloned()
+                .or_else(|| local_child_spec(project_dir, pkg, canonical.get(&key).copied()?))
                 .unwrap_or_else(|| {
                     crate::npm::dep_value_as_version(dep_name, dep_value).to_string()
                 });
@@ -348,14 +359,35 @@ pub fn write(
         // collapsed to the alias name and produced a gratuitous diff
         // against bun's own output.
         let ident_name = pkg.alias_of.as_deref().unwrap_or(&pkg.name);
-        let ident = format!("{}@{}", ident_name, pkg.version);
         let integrity = pkg.integrity.clone().unwrap_or_default();
-        let entry = Value::Array(vec![
-            Value::String(ident),
-            Value::String(String::new()),
-            Value::Object(meta),
-            Value::String(integrity),
-        ]);
+        // bun identifies `file:` packages by their root-relative path:
+        // `[name@file:dir, meta]` for a directory and
+        // `[name@./file.tgz, meta, integrity]` for a tarball.
+        let entry = match &pkg.local_source {
+            Some(LocalSource::Directory(dir)) => Value::Array(vec![
+                Value::String(format!("{ident_name}@file:{}", bun_local_path(dir))),
+                Value::Object(meta),
+            ]),
+            Some(LocalSource::Tarball(tarball)) => {
+                let tarball = bun_local_path(tarball);
+                let prefix = if tarball.starts_with("..") || Path::new(&tarball).is_absolute() {
+                    ""
+                } else {
+                    "./"
+                };
+                Value::Array(vec![
+                    Value::String(format!("{ident_name}@{prefix}{tarball}")),
+                    Value::Object(meta),
+                    Value::String(integrity),
+                ])
+            }
+            _ => Value::Array(vec![
+                Value::String(format!("{}@{}", ident_name, pkg.version)),
+                Value::String(String::new()),
+                Value::Object(meta),
+                Value::String(integrity),
+            ]),
+        };
         package_entries.push((bun_key, entry));
     }
 
@@ -554,6 +586,48 @@ pub fn write(
     );
     crate::atomic_write_lockfile(path, body.as_bytes())?;
     Ok(())
+}
+
+/// A local path in the form bun writes it: normalized, with forward
+/// slashes. A relative path is root-relative and has no leading `./`; an
+/// absolute one stays absolute.
+fn bun_local_path(path: &Path) -> String {
+    aube_util::path::normalize_lexical(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// The `file:` spec a local package declares for a local child, as bun
+/// writes it: relative to the parent's directory, or absolute when the
+/// child's path is. A fresh resolve keeps no declared specs for local
+/// packages, only the child's dep_path. Both paths are anchored at
+/// `project_dir`, so a parent outside the project still gets a path that
+/// leads to the child.
+pub(super) fn local_child_spec(
+    project_dir: &Path,
+    parent: &LockedPackage,
+    child: &LockedPackage,
+) -> Option<String> {
+    let Some(LocalSource::Directory(child_path) | LocalSource::Tarball(child_path)) =
+        &child.local_source
+    else {
+        return None;
+    };
+    let relative = match &parent.local_source {
+        Some(LocalSource::Directory(parent_dir)) if !child_path.is_absolute() => {
+            // `diff_paths` finds no relative path between an absolute and a
+            // relative path, so anchor at an absolute project directory.
+            let project_dir =
+                std::path::absolute(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+            let anchored = |p: &Path| aube_util::path::normalize_lexical(&project_dir.join(p));
+            let child_path = anchored(child_path);
+            pathdiff::diff_paths(&child_path, anchored(parent_dir))
+                .map(|relative| bun_local_path(&relative))
+                .unwrap_or_else(|| bun_local_path(&child_path))
+        }
+        _ => bun_local_path(child_path),
+    };
+    Some(format!("file:{relative}"))
 }
 
 /// Hand-written JSONC emitter matching bun 1.2's `bun.lock` style.

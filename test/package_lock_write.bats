@@ -89,6 +89,70 @@ teardown() {
 	assert_dir_exists node_modules/is-odd
 }
 
+# A project with file: directory and tarball deps, and the bun.lock
+# bun 1.4 writes for it.
+_bun_file_packages_project() {
+	mkdir -p vendor/x vendor/y vendor/t/package
+	echo '{"name":"x","version":"1.2.3","dependencies":{"y":"file:../y"}}' >vendor/x/package.json
+	echo '{"name":"y","version":"0.1.0"}' >vendor/y/package.json
+	echo '{"name":"t","version":"3.0.0"}' >vendor/t/package/package.json
+	tar -czf vendor/t.tgz -C vendor/t package
+	echo '{"name":"root","private":true,"dependencies":{"x":"file:./vendor/x","t":"file:./vendor/t.tgz"}}' >package.json
+	# The shapes bun 1.4 writes for these packages.
+	cat >bun.lock <<'EOF'
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "root",
+      "dependencies": {
+        "t": "file:./vendor/t.tgz",
+        "x": "file:./vendor/x",
+      },
+    },
+  },
+  "packages": {
+    "t": ["t@./vendor/t.tgz", {}, ""],
+
+    "x": ["x@file:vendor/x", { "dependencies": { "y": "file:../y" } }],
+
+    "x/y": ["y@file:vendor/y", {}],
+  }
+}
+EOF
+}
+
+@test "aube install keeps file: packages in bun.lock on re-resolve" {
+	_bun_file_packages_project
+
+	run aube install --no-frozen-lockfile
+	assert_success
+
+	run grep -F '"x": ["x@file:vendor/x", { "dependencies": { "y": "file:../y" } }]' bun.lock
+	assert_success
+	run grep -F '["y@file:vendor/y", {}]' bun.lock
+	assert_success
+	run grep -F '"t": ["t@./vendor/t.tgz", {}, ""]' bun.lock
+	assert_success
+
+	rm -rf node_modules
+	run aube install --frozen-lockfile
+	assert_success
+	assert_file_exists node_modules/x/package.json
+	assert_file_exists node_modules/t/package.json
+}
+
+@test "bun accepts the bun.lock aube rewrites for file: packages" {
+	command -v bun >/dev/null || skip "bun is not installed"
+	_bun_file_packages_project
+	run aube install --no-frozen-lockfile
+	assert_success
+
+	rm -rf node_modules
+	run bun install --frozen-lockfile
+	assert_success
+}
+
 @test "aube install preserves pnpm-lock.yaml format on re-resolve (does not create aube-lock.yaml)" {
 	cp "$PROJECT_ROOT/fixtures/basic/package.json" .
 	cp "$PROJECT_ROOT/fixtures/basic/pnpm-lock.yaml" .
