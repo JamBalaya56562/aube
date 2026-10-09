@@ -2331,3 +2331,273 @@ fn test_write_does_not_nest_members_under_another_members_path() {
     let reparsed = parse(&path).unwrap();
     assert_eq!(reparsed.importers["a"][0].dep_path, "is-number@7.0.0");
 }
+
+/// bun gives the top-level slot of a member the root asks for with
+/// `workspace:` to that member, and nests a registry package of the same
+/// name under the package that depends on it.
+#[test]
+fn test_write_keeps_the_root_workspace_dep_at_the_top_level() {
+    let mut graph = LockfileGraph::default();
+    for (name, version, deps) in [
+        ("is-number", "6.0.0", vec![]),
+        ("is-odd", "3.0.1", vec![("is-number", "6.0.0")]),
+    ] {
+        graph.packages.insert(
+            format!("{name}@{version}"),
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                dep_path: format!("{name}@{version}"),
+                dependencies: deps
+                    .into_iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    graph.importers.insert(
+        ".".to_string(),
+        vec![
+            is_number_dep("is-number@1.0.0", "workspace:*"),
+            DirectDep {
+                name: "is-odd".to_string(),
+                dep_path: "is-odd@3.0.1".to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("^3.0.1".to_string()),
+            },
+        ],
+    );
+    graph
+        .importers
+        .insert("packages/is-number".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[(
+            "packages/is-number",
+            r#"{"name":"is-number","version":"1.0.0"}"#,
+        )],
+        &[("is-number", "workspace:*"), ("is-odd", "^3.0.1")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""is-number": ["is-number@workspace:packages/is-number"]"#),
+        "{written}"
+    );
+    assert!(
+        written.contains(r#""is-odd/is-number": ["is-number@6.0.0""#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    let root_dep = reparsed.importers["."]
+        .iter()
+        .find(|dep| dep.name == "is-number")
+        .unwrap();
+    assert!(
+        matches!(
+            reparsed.packages[&root_dep.dep_path].local_source,
+            Some(LocalSource::Link(_))
+        ),
+        "{root_dep:?}"
+    );
+    assert_eq!(
+        reparsed.packages["is-odd@3.0.1"].dependencies["is-number"],
+        "6.0.0"
+    );
+}
+
+/// A member's own registry dep on a name the root reserves for a
+/// workspace member goes under that member, as bun writes it.
+#[test]
+fn test_write_nests_a_members_registry_dep_on_a_reserved_name() {
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        "is-number@6.0.0".to_string(),
+        LockedPackage {
+            name: "is-number".to_string(),
+            version: "6.0.0".to_string(),
+            dep_path: "is-number@6.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![is_number_dep("is-number@1.0.0", "workspace:*")],
+    );
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![is_number_dep("is-number@6.0.0", "^6.0.0")],
+    );
+    graph
+        .importers
+        .insert("packages/is-number".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            (
+                "packages/is-number",
+                r#"{"name":"is-number","version":"1.0.0"}"#,
+            ),
+            (
+                "packages/app",
+                r#"{"name":"app","version":"1.0.0","dependencies":{"is-number":"^6.0.0"}}"#,
+            ),
+        ],
+        &[("is-number", "workspace:*")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""is-number": ["is-number@workspace:packages/is-number"]"#),
+        "{written}"
+    );
+    assert!(
+        written.contains(r#""app/is-number": ["is-number@6.0.0""#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    assert_eq!(
+        reparsed.importers["packages/app"][0].dep_path,
+        "is-number@6.0.0"
+    );
+    let root_dep = &reparsed.importers["."][0];
+    assert!(
+        matches!(
+            reparsed.packages[&root_dep.dep_path].local_source,
+            Some(LocalSource::Link(_))
+        ),
+        "{root_dep:?}"
+    );
+}
+
+/// The deps of a member's nested registry package go below that package,
+/// so they don't shadow the member's own direct deps.
+#[test]
+fn test_write_nests_the_deps_of_a_members_nested_package_below_it() {
+    let mut graph = LockfileGraph::default();
+    for (name, version, deps) in [
+        ("is-number", "6.0.0", vec![]),
+        ("is-number", "7.0.0", vec![]),
+        ("is-odd", "3.0.1", vec![("is-number", "6.0.0")]),
+    ] {
+        graph.packages.insert(
+            format!("{name}@{version}"),
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                dep_path: format!("{name}@{version}"),
+                dependencies: deps
+                    .into_iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let is_odd_dep = |dep_path: &str, specifier: &str| DirectDep {
+        name: "is-odd".to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some(specifier.to_string()),
+    };
+    graph.importers.insert(
+        ".".to_string(),
+        vec![is_odd_dep("is-odd@1.0.0", "workspace:*")],
+    );
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![
+            is_odd_dep("is-odd@3.0.1", "^3.0.1"),
+            is_number_dep("is-number@7.0.0", "^7.0.0"),
+        ],
+    );
+    graph
+        .importers
+        .insert("packages/is-odd".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            ("packages/is-odd", r#"{"name":"is-odd","version":"1.0.0"}"#),
+            (
+                "packages/app",
+                r#"{"name":"app","version":"1.0.0","dependencies":{"is-odd":"^3.0.1","is-number":"^7.0.0"}}"#,
+            ),
+        ],
+        &[("is-odd", "workspace:*")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""app/is-odd/is-number": ["is-number@6.0.0""#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    let app_number = reparsed.importers["packages/app"]
+        .iter()
+        .find(|dep| dep.name == "is-number")
+        .unwrap();
+    assert_eq!(app_number.dep_path, "is-number@7.0.0", "{written}");
+    assert_eq!(
+        reparsed.packages["is-odd@3.0.1"].dependencies["is-number"],
+        "6.0.0"
+    );
+}
+
+/// A member's nested package that depends on another version of its own
+/// name keeps that version one level below it.
+#[test]
+fn test_write_keeps_a_nested_packages_same_name_dep_one_level_below() {
+    let mut graph = LockfileGraph::default();
+    for (version, deps) in [("1.0.0", vec![]), ("2.0.0", vec![("foo", "1.0.0")])] {
+        graph.packages.insert(
+            format!("foo@{version}"),
+            LockedPackage {
+                name: "foo".to_string(),
+                version: version.to_string(),
+                dep_path: format!("foo@{version}"),
+                dependencies: deps
+                    .into_iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let foo_dep = |dep_path: &str, specifier: &str| DirectDep {
+        name: "foo".to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some(specifier.to_string()),
+    };
+    graph
+        .importers
+        .insert(".".to_string(), vec![foo_dep("foo@0.1.0", "workspace:*")]);
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![foo_dep("foo@2.0.0", "^2.0.0")],
+    );
+    graph
+        .importers
+        .insert("packages/foo".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            ("packages/foo", r#"{"name":"foo","version":"0.1.0"}"#),
+            (
+                "packages/app",
+                r#"{"name":"app","version":"1.0.0","dependencies":{"foo":"^2.0.0"}}"#,
+            ),
+        ],
+        &[("foo", "workspace:*")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""app/foo/foo": ["foo@1.0.0""#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    assert_eq!(reparsed.importers["packages/app"][0].dep_path, "foo@2.0.0");
+    assert_eq!(reparsed.packages["foo@2.0.0"].dependencies["foo"], "1.0.0");
+}
