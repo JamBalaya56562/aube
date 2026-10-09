@@ -485,6 +485,56 @@ pub fn write(
         };
         package_entries.push((key, entry));
     }
+    // A freshly resolved graph has no `link:` package for a member that
+    // nothing depends on, or whose dependents reach it by version. bun
+    // still lists every member; without the entry the reader can't wire
+    // workspace deps, and installs from the lockfile skip those links.
+    // When a package already takes a member's name, bun nests the member
+    // under each member that asks for it with `workspace:` instead.
+    let taken: BTreeSet<String> = package_entries
+        .iter()
+        .map(|(key, _)| key.clone())
+        .filter(|key| !emitted_workspace_keys.contains(key))
+        .collect();
+    for (importer_path, pj) in &workspace_manifests {
+        let Some(name) = pj.name.as_deref() else {
+            continue;
+        };
+        let ident = Value::Array(vec![Value::String(format!(
+            "{name}@workspace:{importer_path}"
+        ))]);
+        if !taken.contains(name) {
+            if emitted_workspace_keys.insert(name.to_string()) {
+                package_entries.push((name.to_string(), ident));
+            }
+            continue;
+        }
+        for (dependent_path, dependent) in &workspace_manifests {
+            let Some(dependent_name) = dependent.name.as_deref() else {
+                continue;
+            };
+            let asks = [
+                &dependent.dependencies,
+                &dependent.dev_dependencies,
+                &dependent.optional_dependencies,
+            ]
+            .into_iter()
+            .any(|deps| {
+                deps.get(name)
+                    .is_some_and(|spec| spec.starts_with("workspace:"))
+            });
+            // The reader also looks up `<dependent>/<name>` from a package
+            // keyed `<dependent>` and from a member whose path is
+            // `<dependent>`; nesting there would hand them the member.
+            let shared = taken.contains(dependent_name)
+                || (dependent_path != dependent_name
+                    && workspace_manifests.contains_key(dependent_name));
+            let key = format!("{dependent_name}/{name}");
+            if asks && !shared && !taken.contains(&key) {
+                package_entries.push((key, ident.clone()));
+            }
+        }
+    }
     package_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Echo back the parsed `configVersion` (default 1 for older v1.1
