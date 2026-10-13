@@ -1310,7 +1310,8 @@ impl<'a> ResolveDriver<'a> {
                         )])
                     })
                     .unwrap_or_default(),
-            },
+            }
+            .with_declared_dependencies_known(),
         );
 
         // Enqueue transitive deps. Kick off a background
