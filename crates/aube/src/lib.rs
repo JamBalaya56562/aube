@@ -1005,6 +1005,7 @@ async fn async_main(cli: Cli, invoked_as_aubr: bool) -> miette::Result<Option<i3
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to change directory to {}", dir.display()))?;
     }
+    crate::dirs::set_dir_flag_given(cli.dir.is_some());
 
     let print_top_level_version = should_print_top_level_version(&cli);
     if cli.workspace_root && !print_top_level_version {
