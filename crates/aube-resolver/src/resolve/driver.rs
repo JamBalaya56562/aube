@@ -1178,12 +1178,11 @@ impl<'a> ResolveDriver<'a> {
         // range (debug's optional `supports-color`, typescript-eslint's
         // optional `typescript`, …). Synthesize the same `*` so peer
         // context resolves these exactly like pnpm: an optional peer that
-        // a real ancestor / the workspace root provides (typescript) gets
-        // a dep-path suffix, while one nothing on the path provides
-        // (supports-color) is left unresolved and surfaces under
-        // `transitivePeerDependencies`. The optional-peer branch in
-        // `visit_peer_context` is what keeps the graph-wide scan from
-        // binding the latter to an unrelated copy in the tree.
+        // an ancestor, the workspace root, or any satisfying version
+        // elsewhere in the graph provides gets a dep-path suffix, while
+        // one nothing in the graph satisfies is left unresolved and
+        // surfaces under `transitivePeerDependencies`. See the
+        // optional-peer branch in `visit_peer_context`.
         let mut peer_deps = version_meta.peer_dependencies.clone();
         for name in version_meta.peer_dependencies_meta.keys() {
             peer_deps
