@@ -1898,16 +1898,18 @@ impl<'a> ResolveDriver<'a> {
         // loop, so overrides can still target a catalog dep by bare
         // name. The raw `catalog:...` text stays in `original_specifier`;
         // the separate lockfile field changes only if an override fires.
+        //
+        // The pick is only recorded in the lockfile's `catalogs:` block
+        // when the catalog value survives the override pass below: pnpm
+        // drops entries whose range an override replaced.
+        let mut catalog_pick: Option<(String, String)> = None;
         if let Some((catalog_name, real_range)) = self
             .resolver
             .resolve_catalog_spec(&task.name, &task.range)?
         {
             tracing::trace!("catalog: {} {} -> {}", task.name, task.range, real_range);
-            self.catalog_picks
-                .entry(catalog_name)
-                .or_default()
-                .insert(task.name.clone(), real_range.clone());
-            task.range = real_range;
+            task.range = real_range.clone();
+            catalog_pick = Some((catalog_name, real_range));
         }
 
         for _ in 0..2 {
@@ -1965,13 +1967,11 @@ impl<'a> ResolveDriver<'a> {
                 if is_non_registry_specifier(&effective_spec) {
                     task.range_from_override = true;
                 }
+                // The override replaced the catalog reference, so the
+                // pre-pass pick no longer drives resolution. Only the
+                // override's own catalog target (if any) is recorded.
+                catalog_pick = pending_pick;
                 if task.range != effective_spec {
-                    if let Some((catalog_name, real_range)) = pending_pick {
-                        self.catalog_picks
-                            .entry(catalog_name)
-                            .or_default()
-                            .insert(task.name.clone(), real_range);
-                    }
                     tracing::trace!(
                         "override: {}@{} -> {}",
                         task.name,
@@ -2071,6 +2071,12 @@ impl<'a> ResolveDriver<'a> {
             if !changed {
                 break;
             }
+        }
+        if let Some((catalog_name, real_range)) = catalog_pick {
+            self.catalog_picks
+                .entry(catalog_name)
+                .or_default()
+                .insert(task.name.clone(), real_range);
         }
         Ok(true)
     }
