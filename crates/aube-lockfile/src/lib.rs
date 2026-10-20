@@ -35,6 +35,17 @@ pub(crate) const EXTRA_PRESERVE_TARBALL_URL: &str = "__aube_preserve_tarball_url
 /// [`LockedPackage::declared_dependencies_known`]. Writers never emit it.
 pub(crate) const EXTRA_DECLARED_DEPENDENCIES_KNOWN: &str = "__aube_declared_dependencies_known";
 
+/// `LockedPackage::extra_meta` key holding yarn berry blocks the parser
+/// skipped but the writer must re-emit verbatim (the `builtin<compat/…>`
+/// patch entries yarn adds for `typescript`, `resolve` and `fsevents`).
+pub(crate) const EXTRA_YARN_BERRY_METADATA: &str = "__aube_yarn_berry_metadata";
+
+/// `LockedPackage::extra_meta` key holding a berry block's `conditions:`
+/// value (`os=darwin & cpu=arm64`), written back verbatim.
+pub(crate) const EXTRA_YARN_BERRY_CONDITIONS: &str = "__aube_yarn_berry_conditions";
+
+pub(crate) const EXTRA_YARN_BERRY_PRESERVED_BLOCKS: &str = "__aube_yarn_berry_preserved_blocks";
+
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 

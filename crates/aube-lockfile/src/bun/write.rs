@@ -414,6 +414,8 @@ pub fn write(
             if MODELED_META_KEYS.contains(&k.as_str())
                 || k == crate::EXTRA_PRESERVE_TARBALL_URL
                 || k == crate::EXTRA_DECLARED_DEPENDENCIES_KNOWN
+                || k == crate::EXTRA_YARN_BERRY_PRESERVED_BLOCKS
+                || k == crate::EXTRA_YARN_BERRY_CONDITIONS
             {
                 continue;
             }
@@ -689,7 +691,7 @@ pub fn write(
         "catalogs",
     ];
     for (k, v) in &graph.extra_fields {
-        if MODELED_TOP_KEYS.contains(&k.as_str()) {
+        if MODELED_TOP_KEYS.contains(&k.as_str()) || k == crate::EXTRA_YARN_BERRY_METADATA {
             continue;
         }
         top_level_extras.push((k.clone(), v.clone()));
