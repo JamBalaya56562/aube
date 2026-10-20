@@ -1401,6 +1401,23 @@ JSON
 	[ "$shard_count" -gt 0 ]
 }
 
+@test "aube install treats an empty CI env var as not CI" {
+	_setup_basic_fixture
+	# Loosen the range so the lockfile specifier no longer matches
+	node -e '
+		const fs = require("fs");
+		const pkg = JSON.parse(fs.readFileSync("package.json"));
+		pkg.dependencies["is-odd"] = "^3.0.0";
+		fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
+	'
+	CI=1 run aube install
+	assert_failure
+	assert_output --partial "lockfile is out of date"
+	CI='' run aube install
+	assert_success
+	refute_output --partial "lockfile is out of date"
+}
+
 @test "aube install --force restores a deleted file in a per-project virtual store" {
 	_setup_basic_fixture
 	run aube --disable-global-virtual-store install
