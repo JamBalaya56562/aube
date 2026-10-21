@@ -56,13 +56,15 @@ teardown() {
 	# exists and that known packages appear as block headers.
 	run grep -c '# yarn lockfile v1' yarn.lock
 	assert_success
-	run grep -c '"is-odd@3.0.1"' yarn.lock
+	run grep -c '^is-odd@3.0.1:$' yarn.lock
+	assert_success
+	# Every entry keeps a `resolved` line through the rewrite.
+	run grep -c '^  resolved "' yarn.lock
 	assert_success
 
 	# Second install from the regenerated yarn.lock must succeed.
-	# The writer emits multi-spec block headers (exact `name@version`
-	# *plus* the manifest range), so reparse finds direct deps via
-	# the manifest lookup even when the fixture uses range specs.
+	# The writer emits yarn's own multi-spec block headers, so reparse
+	# finds direct deps via the manifest lookup.
 	rm -rf node_modules
 	run aube install --frozen-lockfile
 	assert_success
