@@ -67,6 +67,7 @@ impl RegistryClient {
         let http_tarball =
             try_build_http_tarball_client(&config, None, &fetch_policy, &extra_ca_certs)?;
         let mut http_by_uri = BTreeMap::new();
+        let mut http_tarball_by_uri = BTreeMap::new();
         for (uri, registry) in &config.auth_by_uri {
             if !registry.has_tls_material() {
                 continue;
@@ -75,8 +76,18 @@ impl RegistryClient {
                 uri.clone(),
                 try_build_http_client(&config, Some(registry), &fetch_policy, &extra_ca_certs)?,
             );
+            http_tarball_by_uri.insert(
+                uri.clone(),
+                try_build_http_tarball_client(
+                    &config,
+                    Some(registry),
+                    &fetch_policy,
+                    &extra_ca_certs,
+                )?,
+            );
         }
         let mut http_by_uri_scope = BTreeMap::new();
+        let mut http_tarball_by_uri_scope = BTreeMap::new();
         for (uri, by_scope) in &config.scoped_auth_by_uri {
             for (scope, registry) in by_scope {
                 if !registry.has_tls_material() {
@@ -94,6 +105,18 @@ impl RegistryClient {
                             &extra_ca_certs,
                         )?,
                     );
+                http_tarball_by_uri_scope
+                    .entry(uri.clone())
+                    .or_insert_with(BTreeMap::new)
+                    .insert(
+                        scope.clone(),
+                        try_build_http_tarball_client(
+                            &config,
+                            Some(registry),
+                            &fetch_policy,
+                            &extra_ca_certs,
+                        )?,
+                    );
             }
         }
 
@@ -102,6 +125,8 @@ impl RegistryClient {
             http_by_uri,
             http_by_uri_scope,
             http_tarball,
+            http_tarball_by_uri,
+            http_tarball_by_uri_scope,
             token_helper_cache: Mutex::new(BTreeMap::new()),
             auth_token_by_url: Mutex::new(BTreeMap::new()),
             packument_in_flight: Mutex::new(aube_util::collections::FxMap::default()),
