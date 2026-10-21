@@ -5466,8 +5466,8 @@ fn peer_suffix_propagation_skips_self_in_mutual_cycle() {
 // Nested self-suffix: when a package's own peer suffix already encodes
 // a peer name transitively (e.g. `consumer@1(helper@1(core@1))`), the
 // propagation must not double-emit `(core@…)` as a separate flat
-// segment. `peer_names_in_segments_recursive` covers names at any
-// depth in the self set.
+// segment. `consumer -> helper` is an edge to its own peer, so nothing
+// bubbles through it.
 #[test]
 fn peer_suffix_propagation_dedupes_nested_self_segments() {
     // consumer peers on helper. helper peers on core. consumer's
@@ -5516,6 +5516,245 @@ fn peer_suffix_propagation_dedupes_nested_self_segments() {
         !out.packages
             .contains_key("consumer@1.0.0(core@1.0.0)(helper@1.0.0(core@1.0.0))"),
         "propagation must not double-emit a peer name already covered transitively in the self suffix"
+    );
+}
+
+// A package that declares its own peers still picks up a peer that one
+// of its real dependencies resolved from above it. pnpm 11 writes
+// `@ai-sdk/react@4(react@19)(zod@4)` when `react` is its own peer and
+// `zod` is only a peer of its child `@ai-sdk/mcp`.
+#[test]
+fn peer_suffix_propagates_descendant_peer_through_peer_declaring_parent() {
+    let mut parent = mk_locked(
+        "parent",
+        "1.0.0",
+        &[("child", "1.0.0")],
+        &[("react", "^19")],
+    );
+    parent.dep_path = "parent@1.0.0".to_string();
+    let child = mk_locked("child", "1.0.0", &[], &[("zod", "^4")]);
+    let react = mk_locked("react", "19.0.0", &[], &[]);
+    let zod = mk_locked("zod", "4.0.0", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    for p in [parent, child, react, zod] {
+        packages.insert(p.dep_path.clone(), p);
+    }
+
+    let dep = |name: &str, dep_path: &str| DirectDep {
+        name: name.to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some("*".to_string()),
+    };
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![
+            dep("parent", "parent@1.0.0"),
+            dep("react", "react@19.0.0"),
+            dep("zod", "zod@4.0.0"),
+        ],
+    );
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default())
+        .expect("test graph should converge");
+
+    assert!(
+        out.packages
+            .contains_key("parent@1.0.0(react@19.0.0)(zod@4.0.0)"),
+        "parent carries its own peer and its child's resolved peer; got {:?}",
+        out.packages.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.packages["parent@1.0.0(react@19.0.0)(zod@4.0.0)"].transitive_peer_dependencies,
+        vec!["zod".to_string()]
+    );
+}
+
+// A package that peers on a decorated parent embeds the parent's new
+// key in its own suffix, so `consumer` must not keep naming the old one.
+#[test]
+fn peer_suffix_propagation_updates_nested_references_to_rewritten_peers() {
+    let mut consumer = mk_locked("consumer", "1.0.0", &[], &[("parent", "^1")]);
+    consumer.dep_path = "consumer@1.0.0".to_string();
+    let mut parent = mk_locked(
+        "parent",
+        "1.0.0",
+        &[("child", "1.0.0")],
+        &[("react", "^19")],
+    );
+    parent.dep_path = "parent@1.0.0".to_string();
+    let child = mk_locked("child", "1.0.0", &[], &[("zod", "^4")]);
+    let react = mk_locked("react", "19.0.0", &[], &[]);
+    let zod = mk_locked("zod", "4.0.0", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    for p in [consumer, parent, child, react, zod] {
+        packages.insert(p.dep_path.clone(), p);
+    }
+    let dep = |name: &str, dep_path: &str| DirectDep {
+        name: name.to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some("*".to_string()),
+    };
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![
+            dep("consumer", "consumer@1.0.0"),
+            dep("parent", "parent@1.0.0"),
+            dep("react", "react@19.0.0"),
+            dep("zod", "zod@4.0.0"),
+        ],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default())
+        .expect("test graph should converge");
+
+    let keys: Vec<_> = out.packages.keys().collect();
+    assert!(
+        keys.iter()
+            .any(|k| k.starts_with("consumer@1.0.0(parent@1.0.0(react@19.0.0)(zod@4.0.0))")),
+        "consumer names the rewritten parent; got {keys:?}"
+    );
+    assert!(
+        !keys
+            .iter()
+            .any(|k| k.contains("(parent@1.0.0(react@19.0.0))")),
+        "no key keeps the stale parent reference; got {keys:?}"
+    );
+}
+
+// An ancestor that absorbs a consumer's nested peer reference must also
+// follow the rewritten key, whatever the length of the old keys.
+#[test]
+fn peer_suffix_propagation_updates_nested_references_in_ancestors() {
+    let ancestor = mk_locked("ancestor", "1.0.0", &[("consumer", "1.0.0")], &[]);
+    let mut consumer = mk_locked("consumer", "1.0.0", &[], &[("parent", "^1")]);
+    consumer.dep_path = "consumer@1.0.0".to_string();
+    let mut parent = mk_locked(
+        "parent",
+        "1.0.0",
+        &[("child", "1.0.0")],
+        &[("react", "^19")],
+    );
+    parent.dep_path = "parent@1.0.0".to_string();
+    let child = mk_locked("child", "1.0.0", &[], &[("zod", "^4")]);
+    let react = mk_locked("react", "19.0.0", &[], &[]);
+    let zod = mk_locked("zod", "4.0.0", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    for p in [ancestor, consumer, parent, child, react, zod] {
+        packages.insert(p.dep_path.clone(), p);
+    }
+    let dep = |name: &str, dep_path: &str| DirectDep {
+        name: name.to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some("*".to_string()),
+    };
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![
+            dep("ancestor", "ancestor@1.0.0"),
+            dep("parent", "parent@1.0.0"),
+            dep("react", "react@19.0.0"),
+            dep("zod", "zod@4.0.0"),
+        ],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default())
+        .expect("test graph should converge");
+
+    let keys: Vec<_> = out.packages.keys().collect();
+    assert!(
+        keys.iter()
+            .any(|k| k.starts_with("ancestor@1.0.0(parent@1.0.0(react@19.0.0)(zod@4.0.0))")),
+        "ancestor names the rewritten parent; got {keys:?}"
+    );
+    assert!(
+        !keys
+            .iter()
+            .any(|k| k.contains("(parent@1.0.0(react@19.0.0))")),
+        "no key keeps the stale parent reference; got {keys:?}"
+    );
+}
+
+// The `peersSuffixMaxLength` cap is applied after nested references are
+// updated, not before.
+#[test]
+fn peer_suffix_length_cap_applies_to_the_final_nested_suffix() {
+    let mut consumer = mk_locked("consumer", "1.0.0", &[], &[("parent", "^1")]);
+    consumer.dep_path = "consumer@1.0.0".to_string();
+    let mut parent = mk_locked(
+        "parent",
+        "1.0.0",
+        &[("child", "1.0.0")],
+        &[("react", "^19")],
+    );
+    parent.dep_path = "parent@1.0.0".to_string();
+    let child = mk_locked("child", "1.0.0", &[], &[("zod", "^4")]);
+    let react = mk_locked("react", "19.0.0", &[], &[]);
+    let zod = mk_locked("zod", "4.0.0", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    for p in [consumer, parent, child, react, zod] {
+        packages.insert(p.dep_path.clone(), p);
+    }
+    let dep = |name: &str, dep_path: &str| DirectDep {
+        name: name.to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some("*".to_string()),
+    };
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![
+            dep("consumer", "consumer@1.0.0"),
+            dep("parent", "parent@1.0.0"),
+            dep("react", "react@19.0.0"),
+            dep("zod", "zod@4.0.0"),
+        ],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    // The consumer's suffix fits the cap before `parent` gains `(zod@4.0.0)`
+    // (28 chars) and exceeds it afterwards (39 chars).
+    let options = PeerContextOptions {
+        peers_suffix_max_length: 30,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &options).expect("test graph should converge");
+
+    let consumer_keys: Vec<_> = out
+        .packages
+        .keys()
+        .filter(|k| k.starts_with("consumer@1.0.0"))
+        .collect();
+    assert_eq!(consumer_keys.len(), 1, "got {consumer_keys:?}");
+    assert!(
+        !consumer_keys[0].contains("parent@"),
+        "consumer's over-long suffix is hashed; got {consumer_keys:?}"
     );
 }
 

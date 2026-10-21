@@ -482,10 +482,12 @@ pub fn mark_transitive_peer_dependencies(graph: &mut aube_lockfile::LockfileGrap
     }
 
     for (dep_path, pkg) in graph.packages.iter_mut() {
-        pkg.transitive_peer_dependencies = acc
-            .get(dep_path)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
+        let mut names = acc.remove(dep_path).unwrap_or_default();
+        // Peers a descendant resolved from above this package were
+        // recorded by the peer-context pass (the suffix names are gone
+        // once `dedupe_peers` runs); pnpm lists them here too.
+        names.extend(pkg.transitive_peer_dependencies.iter().cloned());
+        pkg.transitive_peer_dependencies = names.into_iter().collect();
     }
 }
 
@@ -805,6 +807,21 @@ mod tests {
         // `host` resolves its `core` peer → nothing unresolved to bubble.
         assert!(tp("host@1.0.0").is_empty());
         assert!(tp("core@1.0.0").is_empty());
+    }
+
+    #[test]
+    fn transitive_peer_dependencies_keep_peers_recorded_by_peer_context() {
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        let (key, mut parent) = pkg_with_peers("parent", &[], &["react"]);
+        parent.transitive_peer_dependencies = vec!["zod".to_string()];
+        graph.packages.insert(key.clone(), parent);
+
+        mark_transitive_peer_dependencies(&mut graph);
+
+        assert_eq!(
+            graph.packages[&key].transitive_peer_dependencies,
+            vec!["zod".to_string()]
+        );
     }
 
     #[test]
