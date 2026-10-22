@@ -536,7 +536,7 @@ impl Linker {
         // lifecycle scripts, the state sidecar) is the install
         // driver's responsibility to skip in this mode.
         if self.virtual_store_only {
-            self.link_hidden_hoist(&aube_dir, graph)?;
+            self.link_hidden_hoist(&aube_dir, &nm, graph)?;
             if let Err(e) = write_applied_patches(&nm, &curr_applied) {
                 let sidecar = applied_patches_sidecar_name();
                 tracing::error!(
@@ -657,7 +657,7 @@ impl Linker {
         // undeclared deps) and wouldn't interact with the
         // root-level symlinks even on name clashes.
         let step4_timer = std::time::Instant::now();
-        self.link_hidden_hoist(&aube_dir, graph)?;
+        self.link_hidden_hoist(&aube_dir, &nm, graph)?;
         tracing::debug!("link:step4 (hidden hoist) {:.1?}", step4_timer.elapsed());
 
         if let Err(e) = write_applied_patches(&nm, &curr_applied) {
@@ -1196,7 +1196,7 @@ impl Linker {
                     try_remove_entry(&entry.path());
                 }
             }
-            self.link_hidden_hoist(&aube_dir, graph)?;
+            self.link_hidden_hoist(&aube_dir, &root_nm, graph)?;
             if let Err(e) = write_applied_patches(&root_nm, &curr_applied) {
                 let sidecar = applied_patches_sidecar_name();
                 tracing::error!(
@@ -1474,7 +1474,7 @@ impl Linker {
 
         // Hidden hoist is shared across importers, so a single sweep
         // here is sufficient for the whole workspace.
-        self.link_hidden_hoist(&aube_dir, graph)?;
+        self.link_hidden_hoist(&aube_dir, &root_nm, graph)?;
 
         if let Err(e) = write_applied_patches(&root_nm, &curr_applied) {
             let sidecar = applied_patches_sidecar_name();
@@ -1505,14 +1505,26 @@ impl Linker {
     /// toolchains canonicalize the package path into
     /// `~/.cache/aube/virtual-store/<hash>/node_modules/<name>`, so we
     /// mirror the hidden hoist under the shared virtual-store root too.
-    fn link_hidden_hoist(&self, aube_dir: &Path, graph: &LockfileGraph) -> Result<(), Error> {
-        self.link_hidden_hoist_at(aube_dir, aube_dir, graph, false, true)?;
+    fn link_hidden_hoist(
+        &self,
+        aube_dir: &Path,
+        root_nm: &Path,
+        graph: &LockfileGraph,
+    ) -> Result<(), Error> {
+        // `virtual_store_only` never creates the root links, so the
+        // parent walk would find nothing there for the root deps.
+        let reserve_root_deps =
+            !self.virtual_store_only && root_links_reachable_from(aube_dir, root_nm);
+        self.link_hidden_hoist_at(aube_dir, aube_dir, graph, false, true, reserve_root_deps)?;
         if self.use_global_virtual_store {
+            // The GVS mirror lives outside the project, so its packages
+            // never reach the root links and keep the root deps eligible.
             self.link_hidden_hoist_at(
                 &self.virtual_store,
                 &self.virtual_store,
                 graph,
                 true,
+                false,
                 false,
             )?;
         }
@@ -1526,6 +1538,7 @@ impl Linker {
         graph: &LockfileGraph,
         use_hashed_subdirs: bool,
         sweep_stale_entries: bool,
+        reserve_root_deps: bool,
     ) -> Result<(), Error> {
         let hidden = hidden_root.join("node_modules");
         // FxHashSet over the borrowed name (lives for the lockfile graph
@@ -1533,16 +1546,31 @@ impl Linker {
         // `String` clone the `HashSet<String>` version forced.
         let mut claimed: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         let packages: Vec<_> = if self.hoist {
-            graph
+            // Like pnpm's `hoistGraph`, never shadow the root importer's
+            // direct deps when a store package's parent walk reaches the
+            // root `node_modules/` after this tree. When it can't (the
+            // GVS mirror, or a `virtualStoreDir` outside the project),
+            // the direct deps (depth 0) stay eligible instead.
+            if reserve_root_deps {
+                claimed.extend(graph.root_deps().iter().map(|d| d.name.as_str()));
+            }
+            let depths = hidden_hoist_depths(graph);
+            let mut candidates: Vec<_> = graph
                 .packages
                 .iter()
-                .filter_map(|(dep_path, pkg)| {
-                    if pkg.local_source.is_some() || !self.hoist_matches(&pkg.name) {
-                        return None;
-                    }
-                    // First-writer-wins on name clashes across versions.
-                    // BTree iteration over `graph.packages` gives a
-                    // deterministic tiebreaker across runs.
+                .filter(|(_, pkg)| pkg.local_source.is_none() && self.hoist_matches(&pkg.name))
+                .map(|(dep_path, pkg)| {
+                    let depth = depths.get(dep_path.as_str()).copied().unwrap_or(u32::MAX);
+                    (depth, dep_path, pkg)
+                })
+                .collect();
+            // Shallowest version wins a name, ties broken by dep path
+            // (BTree order is already sorted, so a stable sort on depth
+            // keeps it), like pnpm's depth-then-node-id ordering.
+            candidates.sort_by_key(|(depth, _, _)| *depth);
+            candidates
+                .into_iter()
+                .filter_map(|(_, dep_path, pkg)| {
                     claimed.insert(pkg.name.as_str()).then_some((dep_path, pkg))
                 })
                 .collect()
@@ -1811,6 +1839,55 @@ pub fn build_workspace_nested_link_targets(
         map.insert(key, dir.clone());
     }
     if map.is_empty() { None } else { Some(map) }
+}
+
+/// Whether a package materialized under `aube_dir` finds the root links
+/// in `root_nm` through Node's parent-directory walk. The walk checks
+/// `<ancestor>/node_modules` for each ancestor of the package's real
+/// path, so `root_nm` must be named `node_modules` and its parent must
+/// contain `aube_dir`.
+fn root_links_reachable_from(aube_dir: &Path, root_nm: &Path) -> bool {
+    let Some(project_dir) = root_nm.parent() else {
+        return false;
+    };
+    if root_nm.file_name() != Some(std::ffi::OsStr::new("node_modules")) {
+        return false;
+    }
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canonical(aube_dir).starts_with(canonical(project_dir))
+}
+
+/// Shortest distance of each dep path from any importer: an importer's
+/// direct deps are depth 0, their deps depth 1, and so on. Packages no
+/// importer reaches are absent.
+fn hidden_hoist_depths(graph: &LockfileGraph) -> rustc_hash::FxHashMap<&str, u32> {
+    let mut depths: rustc_hash::FxHashMap<&str, u32> = rustc_hash::FxHashMap::default();
+    let mut queue = std::collections::VecDeque::new();
+    for dep in graph.importers.values().flatten() {
+        if let Some((dep_path, _)) = graph.packages.get_key_value(&dep.dep_path)
+            && !depths.contains_key(dep_path.as_str())
+        {
+            depths.insert(dep_path, 0);
+            queue.push_back(dep_path);
+        }
+    }
+    while let Some(parent) = queue.pop_front() {
+        let depth = depths[parent.as_str()] + 1;
+        for (name, tail) in &graph.packages[parent].dependencies {
+            let Some(child) =
+                aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
+            else {
+                continue;
+            };
+            if let Some((child, _)) = graph.packages.get_key_value(&child)
+                && !depths.contains_key(child.as_str())
+            {
+                depths.insert(child, depth);
+                queue.push_back(child);
+            }
+        }
+    }
+    depths
 }
 
 /// Dependency edges of per-project local packages whose target is a

@@ -963,10 +963,17 @@ everything, which mirrors pnpm's default of hoisting every
 transitive dep into the hidden tree. Only consulted when
 `hoist=true`.
 
-Matching is case-insensitive; first-writer-wins on name clashes
-across versions, using BTree iteration order for determinism. Set
-to `[]` or a list of only `!` negations to hoist nothing while
-leaving `hoist=true` (equivalent to setting `hoist=false`).
+Matching is case-insensitive. The root project's direct
+dependencies are left out of the hidden tree when packages in the
+virtual store can reach the root `node_modules/` (the default
+layout). The shared global-virtual-store mirror, a
+`virtualStoreDir` outside the project, and `virtualStoreOnly`
+installs (which create no root links) keep them eligible. When a
+name has several versions in the graph, the one closest to an
+importer wins, and equal-depth ties go to the version whose dep
+path sorts first. Set to `[]` or a list of only `!` negations to
+hoist nothing while leaving `hoist=true` (equivalent to setting
+`hoist=false`).
 
 ### `publicHoistPattern` {#setting-publichoistpattern}
 
