@@ -17,14 +17,8 @@ struct WriteNpmLockfile<'a> {
     packages: BTreeMap<String, WriteNpmPackage<'a>>,
 }
 
-// Field order mirrors npm's own package-lock.json output, so a
-// parse → write round-trip diffs cleanly against what `npm install`
-// would produce: `name`, `version`, `resolved`, `integrity`,
-// `license`, then the dep sections, then `bin`, `engines`, platform
-// fields, `funding`, then the dev/optional flags. Don't reorder — the JSON is
-// serialized as a `BTreeMap`-like structure but serde preserves
-// struct field order for us, which is what npm readers (and git
-// diffs) expect.
+// Field order here doesn't reach the file: `write` re-sorts every object
+// with `sort_keys_like_npm`, the same rule npm applies on its own writes.
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct WriteNpmPackage<'a> {
@@ -67,7 +61,7 @@ struct WriteNpmPackage<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     libc: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    funding: Option<WriteNpmFunding<'a>>,
+    funding: Option<serde_json::Value>,
     /// The root manifest's `workspaces` field, copied verbatim as npm
     /// does, so npm and aube rewrites don't flip it back and forth.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,15 +80,6 @@ struct WriteNpmPackage<'a> {
     /// the optional chain (or vice versa with `--omit=optional`).
     #[serde(rename = "devOptional", skip_serializing_if = "std::ops::Not::not")]
     dev_optional: bool,
-}
-
-/// npm emits `funding: {"url": "…"}` verbatim, one key, on every
-/// package entry that declared funding. We only carry the URL on
-/// `LockedPackage`, so this wrapper slots it back into the expected
-/// shape on write.
-#[derive(Debug, Serialize, Default)]
-struct WriteNpmFunding<'a> {
-    url: &'a str,
 }
 
 /// Serialized form of a `peerDependenciesMeta` entry. Mirrors the
@@ -212,6 +197,7 @@ pub fn write(
             optional_dependencies: borrow_map(&manifest.optional_dependencies),
             peer_dependencies: borrow_map(&manifest.peer_dependencies),
             workspaces: manifest.workspaces.as_ref(),
+            funding: manifest_funding(manifest),
             ..Default::default()
         },
     );
@@ -291,14 +277,21 @@ pub fn write(
             declared.get(*name).map(String::as_str) == Some(*spec)
                 || peer_dependencies.get(*name).map(String::as_str) != Some(*spec)
         });
-        let importer_has_install_script =
-            workspace_package_for_importer(graph, importer_path).is_some_and(has_install_script);
+        let workspace_pkg = workspace_package_for_importer(graph, importer_path);
+        let importer_has_install_script = workspace_pkg.is_some_and(has_install_script);
+        // npm copies the member's own `funding` verbatim, so a loaded
+        // manifest is authoritative (no `funding` there means none). The
+        // lockfile's value only stands in when the manifest is missing.
+        let funding = member_manifests
+            .get(importer_path.as_str())
+            .map_or_else(|| workspace_pkg.and_then(npm_funding), manifest_funding);
         packages.insert(
             importer_path.clone(),
             WriteNpmPackage {
                 name: Some(name),
                 version,
                 has_install_script: importer_has_install_script,
+                funding,
                 dependencies,
                 dev_dependencies,
                 optional_dependencies,
@@ -525,6 +518,7 @@ pub fn write(
                     os: pkg.os.to_vec(),
                     cpu: pkg.cpu.to_vec(),
                     libc: pkg.libc.to_vec(),
+                    funding: npm_funding(pkg),
                     dev,
                     optional,
                     dev_optional,
@@ -561,10 +555,7 @@ pub fn write(
                 os: pkg.os.to_vec(),
                 cpu: pkg.cpu.to_vec(),
                 libc: pkg.libc.to_vec(),
-                funding: pkg
-                    .funding_url
-                    .as_deref()
-                    .map(|url| WriteNpmFunding { url }),
+                funding: npm_funding(pkg),
                 dev,
                 optional,
                 dev_optional,
@@ -581,12 +572,117 @@ pub fn write(
         packages,
     };
 
+    let mut value = serde_json::to_value(&doc).map_err(|e| Error::parse(path, e.to_string()))?;
+    sort_keys_like_npm(&mut value);
     let mut body =
-        serde_json::to_string_pretty(&doc).map_err(|e| Error::parse(path, e.to_string()))?;
+        serde_json::to_string_pretty(&value).map_err(|e| Error::parse(path, e.to_string()))?;
     // npm writes a trailing newline; match it so diffs stay clean.
     body.push('\n');
     crate::atomic_write_lockfile(path, body.as_bytes())?;
     Ok(())
+}
+
+/// Keys npm's `json-stringify-nice` call places first, in this order.
+const NPM_PREFERRED_KEYS: [&str; 8] = [
+    "name",
+    "version",
+    "lockfileVersion",
+    "resolved",
+    "integrity",
+    "requires",
+    "packages",
+    "dependencies",
+];
+
+/// Reorder every object the way npm serializes package-lock.json: in each
+/// object, scalar and array values come before object values; within each
+/// group the [`NPM_PREFERRED_KEYS`] lead in their listed order and the
+/// rest follow in `localeCompare(_, 'en')` order. npm re-sorts on every
+/// write, so this reproduces npm's bytes for an entry it wrote, and puts
+/// a new entry where npm would.
+pub(super) fn sort_keys_like_npm(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(map)
+                .into_iter()
+                .map(|(key, mut child)| {
+                    sort_keys_like_npm(&mut child);
+                    (key, child)
+                })
+                .collect();
+            // npm builds the sorted object in JavaScript, which always
+            // lists array-index keys (`"2"`, `"10"`) first in numeric
+            // order, whatever order they were inserted in.
+            entries.sort_by(
+                |(ak, av), (bk, bv)| match (array_index(ak), array_index(bk)) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => av
+                        .is_object()
+                        .cmp(&bv.is_object())
+                        .then_with(|| compare_npm_keys(ak, bk)),
+                },
+            );
+            map.extend(entries);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sort_keys_like_npm),
+        _ => {}
+    }
+}
+
+/// The value of a JavaScript array-index key: the canonical decimal form
+/// (no sign, no leading zero) of an integer below 2^32 - 1.
+fn array_index(key: &str) -> Option<u32> {
+    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if key.len() > 1 && key.starts_with('0') {
+        return None;
+    }
+    key.parse::<u32>().ok().filter(|n| *n != u32::MAX)
+}
+
+fn compare_npm_keys(a: &str, b: &str) -> std::cmp::Ordering {
+    let rank = |key: &str| NPM_PREFERRED_KEYS.iter().position(|k| *k == key);
+    match (rank(a), rank(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => locale_compare_en(a, b),
+    }
+}
+
+/// ASCII punctuation, symbols and digits in ICU's root collation order,
+/// which `String.prototype.localeCompare(_, 'en')` uses. Letters follow,
+/// compared case-insensitively.
+const ICU_ASCII_ORDER: &[u8] = b"_-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$0123456789";
+
+/// Approximates `a.localeCompare(b, 'en')` for the ASCII keys lockfiles
+/// carry: compare primary weights (ICU punctuation order, digits, then
+/// letters ignoring case), then prefer lowercase at the first case
+/// difference. Anything outside ASCII sorts after it by code point.
+fn locale_compare_en(a: &str, b: &str) -> std::cmp::Ordering {
+    fn primary(c: char) -> u32 {
+        if c.is_ascii_alphabetic() {
+            return 100 + u32::from(c.to_ascii_lowercase());
+        }
+        let byte = u8::try_from(c).ok();
+        match byte.and_then(|b| ICU_ASCII_ORDER.iter().position(|o| *o == b)) {
+            // At most ICU_ASCII_ORDER.len() (43), so the cast can't truncate.
+            Some(idx) => idx as u32,
+            None => 1000 + u32::from(c),
+        }
+    }
+    a.chars()
+        .map(primary)
+        .cmp(b.chars().map(primary))
+        .then_with(|| {
+            a.chars()
+                .map(|c| c.is_ascii_uppercase())
+                .cmp(b.chars().map(|c| c.is_ascii_uppercase()))
+        })
+        .then_with(|| a.cmp(b))
 }
 
 /// Read npm's existing top-level install choices before replacing the file.
@@ -632,6 +728,37 @@ fn directory_target(dir: &Path) -> String {
     aube_util::path::normalize_lexical(dir)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// The `funding` value to write: the verbatim value read from an existing
+/// package-lock.json wins, since a freshly resolved entry only knows the URL.
+fn npm_funding(pkg: &LockedPackage) -> Option<serde_json::Value> {
+    pkg.extra_meta
+        .get(crate::EXTRA_NPM_FUNDING)
+        .cloned()
+        .or_else(|| {
+            pkg.funding_url
+                .as_deref()
+                .map(|url| serde_json::json!({ "url": url }))
+        })
+}
+
+/// A project manifest's `funding`, verbatim, skipped the way npm's
+/// `metaFieldFromPkg` skips it: falsy values and empty objects or arrays.
+fn manifest_funding(manifest: &aube_manifest::PackageJson) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    manifest
+        .extra
+        .get("funding")
+        .filter(|value| match value {
+            Value::Null | Value::Bool(false) => false,
+            Value::String(s) => !s.is_empty(),
+            Value::Number(n) => n.as_f64() != Some(0.0),
+            Value::Array(items) => !items.is_empty(),
+            Value::Object(map) => !map.is_empty(),
+            Value::Bool(true) => true,
+        })
+        .cloned()
 }
 
 fn has_install_script(pkg: &LockedPackage) -> bool {
