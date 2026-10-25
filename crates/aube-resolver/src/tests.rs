@@ -4751,6 +4751,42 @@ async fn fresh_resolve_records_deprecated_reason_on_extra_meta() {
     );
 }
 
+// A string-form `bin` is named after the real package without its scope,
+// the key npm and bun write (`@scope/tool` -> `tool`), and an alias keeps
+// the registry name rather than the alias.
+#[tokio::test]
+async fn string_bin_is_named_after_unscoped_real_package() {
+    let mut scoped = make_packument("@fixture/metadata", &["1.0.0"], "1.0.0");
+    scoped
+        .versions
+        .get_mut("1.0.0")
+        .unwrap()
+        .bin
+        .insert(String::new(), "./cli.js".to_string());
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client);
+    resolver
+        .cache
+        .insert("@fixture/metadata".to_string(), scoped.into());
+
+    let mut manifest = PackageJson::default();
+    manifest
+        .dependencies
+        .insert("@fixture/metadata".to_string(), "1.0.0".to_string());
+
+    let graph = resolver
+        .resolve(&manifest, None)
+        .await
+        .expect("resolve failed");
+
+    let bin = &graph.packages["@fixture/metadata@1.0.0"].bin;
+    assert_eq!(bin.len(), 1);
+    assert_eq!(bin.get("metadata").map(String::as_str), Some("./cli.js"));
+}
+
 // A fresh resolve must carry the packument's `hasInstallScript` onto the
 // LockedPackage (via `extra_meta`) so the npm writer flags new entries;
 // `npm ci` skips a dependency's postinstall when the flag is missing.
