@@ -781,6 +781,8 @@ fn apply_peer_contexts_once(
         name_index.entry(pkg.name.as_str()).or_default().push(pkg);
     }
 
+    let cyclic_peer_identities = cyclic_peer_identities(&canonical);
+
     // Root-importer scope used by `resolve-peers-from-workspace-root`.
     // Computed once from the canonical input so it reflects the
     // contextualized state of every root dep on fixed-point iterations
@@ -830,6 +832,7 @@ fn apply_peer_contexts_once(
                 &mut visiting,
                 options,
                 hashed_suffixes,
+                &cyclic_peer_identities,
             )
             .unwrap_or_else(|| dep.dep_path.clone());
             new_deps.push(DirectDep {
@@ -1757,6 +1760,107 @@ fn apply_dedupe_peers_to_tail(tail: &str) -> String {
     apply_dedupe_peers_to_key(tail)
 }
 
+/// Graph keys that sit on a cycle of declared peer dependencies (`a` peers
+/// on `b` and `b` on `a`). pnpm writes such a provider as a bare
+/// `name@version` in a consumer's suffix, since its own suffix would embed
+/// the consumer chain again. Membership is per graph key, peer context
+/// included: a cycle through one `host@1` context says nothing about
+/// another `host@1` context or about `host@2`.
+fn cyclic_peer_identities(graph: &LockfileGraph) -> FxHashSet<String> {
+    let nodes: Vec<&LockedPackage> = graph.packages.values().collect();
+    let index_of: FxHashMap<&str, usize> = graph
+        .packages
+        .keys()
+        .enumerate()
+        .map(|(i, key)| (key.as_str(), i))
+        .collect();
+    // Edges follow the providers a package is actually wired to for its
+    // declared peers (auto-installed on the first pass, resolved by the
+    // peer-context pass afterwards), so unrelated installed versions of a
+    // peer never join a cycle.
+    let edges: Vec<Vec<usize>> = nodes
+        .iter()
+        .map(|pkg| {
+            pkg.peer_dependencies
+                .keys()
+                .filter_map(|peer| {
+                    let tail = pkg.dependencies.get(peer)?;
+                    let key = aube_lockfile::resolve_dep_edge(peer, tail, |key| {
+                        graph.packages.contains_key(key)
+                    })?;
+                    index_of.get(key.as_str()).copied()
+                })
+                .collect()
+        })
+        .collect();
+
+    struct Tarjan<'a> {
+        edges: &'a [Vec<usize>],
+        index: Vec<Option<usize>>,
+        low: Vec<usize>,
+        stack: Vec<usize>,
+        on_stack: Vec<bool>,
+        next: usize,
+        cyclic: Vec<usize>,
+    }
+
+    impl Tarjan<'_> {
+        fn visit(&mut self, node: usize) {
+            self.index[node] = Some(self.next);
+            self.low[node] = self.next;
+            self.next += 1;
+            self.stack.push(node);
+            self.on_stack[node] = true;
+            for &next in &self.edges[node] {
+                match self.index[next] {
+                    None => {
+                        self.visit(next);
+                        self.low[node] = self.low[node].min(self.low[next]);
+                    }
+                    Some(order) if self.on_stack[next] => {
+                        self.low[node] = self.low[node].min(order);
+                    }
+                    Some(_) => {}
+                }
+            }
+            if Some(self.low[node]) != self.index[node] {
+                return;
+            }
+            let mut component = Vec::new();
+            while let Some(member) = self.stack.pop() {
+                self.on_stack[member] = false;
+                component.push(member);
+                if member == node {
+                    break;
+                }
+            }
+            if component.len() > 1 || self.edges[node].contains(&node) {
+                self.cyclic.extend(component);
+            }
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        edges: &edges,
+        index: vec![None; nodes.len()],
+        low: vec![0; nodes.len()],
+        stack: Vec::new(),
+        on_stack: vec![false; nodes.len()],
+        next: 0,
+        cyclic: Vec::new(),
+    };
+    for node in 0..nodes.len() {
+        if tarjan.index[node].is_none() {
+            tarjan.visit(node);
+        }
+    }
+    tarjan
+        .cyclic
+        .into_iter()
+        .map(|i| nodes[i].dep_path.clone())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn visit_peer_context<'g>(
     input_dep_path: &str,
@@ -1768,6 +1872,7 @@ fn visit_peer_context<'g>(
     visiting: &mut FxHashSet<String>,
     options: &PeerContextOptions,
     hashed_suffixes: &mut HashedSuffixes,
+    cyclic_peer_identities: &FxHashSet<String>,
 ) -> Option<String> {
     let pkg = graph.packages.get(input_dep_path)?;
 
@@ -1993,7 +2098,7 @@ fn visit_peer_context<'g>(
     // `dedupe_peer_suffixes` after cycle detection is done.
     let mut suffix_parts: Vec<String> = peer_context
         .iter()
-        .map(|(_, provider)| {
+        .map(|(n, provider)| {
             let cycles_back = refers_back_through_hashes(
                 &provider.context_tail,
                 &canonical_base,
@@ -2001,7 +2106,12 @@ fn visit_peer_context<'g>(
             ) || registry_base.as_deref().is_some_and(|base| {
                 refers_back_through_hashes(&provider.context_tail, base, hashed_suffixes)
             });
-            let display_v = if cycles_back {
+            let in_peer_cycle = !cyclic_peer_identities.is_empty()
+                && aube_lockfile::resolve_dep_edge(n, &provider.target_tail, |key| {
+                    graph.packages.contains_key(key)
+                })
+                .is_some_and(|key| cyclic_peer_identities.contains(&key));
+            let display_v = if cycles_back || in_peer_cycle {
                 canonical_tail(&provider.context_tail).to_string()
             } else {
                 provider.context_tail.clone()
@@ -2090,6 +2200,7 @@ fn visit_peer_context<'g>(
             visiting,
             options,
             hashed_suffixes,
+            cyclic_peer_identities,
         );
         let new_tail = match child_new {
             Some(new_dep_path) => new_dep_path
@@ -2121,6 +2232,7 @@ fn visit_peer_context<'g>(
             visiting,
             options,
             hashed_suffixes,
+            cyclic_peer_identities,
         );
         // A peer provider with no `packages:` entry is a workspace
         // package (the resolver only records a `DirectDep` for those).
@@ -2646,6 +2758,172 @@ mod tests {
                 .contains_key("lib@2.1.0(@tsc-rs/typescript@0.8.0)"),
             "got keys: {:?}",
             out.packages.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn peer_cycle_through_incompatible_required_peer_is_detected() {
+        let mut g = LockfileGraph::default();
+        // `plugin` requires `host@^2` but is still wired to `host@1`.
+        let mut host = locked("host", &[("plugin", "1.0.0")]);
+        host.peer_dependencies
+            .insert("plugin".to_string(), "*".to_string());
+        let mut plugin = locked("plugin", &[("host", "1.0.0")]);
+        plugin
+            .peer_dependencies
+            .insert("host".to_string(), "^2".to_string());
+        g.packages.insert(host.dep_path.clone(), host);
+        g.packages.insert(plugin.dep_path.clone(), plugin);
+
+        let identities = cyclic_peer_identities(&g);
+
+        assert!(identities.contains("host@1.0.0"));
+        assert!(identities.contains("plugin@1.0.0"));
+    }
+
+    #[test]
+    fn peer_cycle_membership_is_per_peer_context() {
+        let mut g = LockfileGraph::default();
+        let host = |color: &str| {
+            let dep_path = format!("host@1.0.0(color@{color})");
+            let mut pkg = LockedPackage {
+                dep_path,
+                ..locked("host", &[])
+            };
+            pkg.peer_dependencies
+                .insert("plugin".to_string(), "*".to_string());
+            pkg
+        };
+        let mut plugin = locked("plugin", &[("host", "1.0.0(color@1.0.0)")]);
+        plugin
+            .peer_dependencies
+            .insert("host".to_string(), "*".to_string());
+        let mut host_one = host("1.0.0");
+        host_one
+            .dependencies
+            .insert("plugin".to_string(), "1.0.0".to_string());
+        for pkg in [host_one, host("2.0.0"), plugin] {
+            g.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+
+        let identities = cyclic_peer_identities(&g);
+
+        assert!(identities.contains("host@1.0.0(color@1.0.0)"));
+        assert!(!identities.contains("host@1.0.0(color@2.0.0)"));
+    }
+
+    #[test]
+    fn peer_cycle_bare_identity_applies_only_to_the_cyclic_version() {
+        let mut g = LockfileGraph::default();
+        let versioned = |name: &str, version: &str, peers: &[&str]| {
+            let mut pkg = LockedPackage {
+                version: version.to_string(),
+                dep_path: format!("{name}@{version}"),
+                dependencies: peers
+                    .iter()
+                    .map(|peer| ((*peer).to_string(), "1.0.0".to_string()))
+                    .collect(),
+                ..locked(name, &[])
+            };
+            pkg.peer_dependencies = peers
+                .iter()
+                .map(|peer| ((*peer).to_string(), "*".to_string()))
+                .collect();
+            pkg
+        };
+        // host@1 <-> plugin is a cycle; host@2 only peers on color and
+        // plugin is never wired to it.
+        let host2 = versioned("host", "2.0.0", &["color"]);
+        let mut consumer = versioned("consumer", "1.0.0", &[]);
+        consumer
+            .dependencies
+            .insert("host".to_string(), "2.0.0".to_string());
+        for pkg in [
+            versioned("host", "1.0.0", &["plugin"]),
+            versioned("plugin", "1.0.0", &["host"]),
+            host2,
+            versioned("color", "1.0.0", &[]),
+            consumer,
+        ] {
+            g.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+        g.importers.insert(
+            ".".to_string(),
+            vec![
+                DirectDep {
+                    name: "consumer".to_string(),
+                    dep_path: "consumer@1.0.0".to_string(),
+                    dep_type: DepType::Production,
+                    specifier: Some("1.0.0".to_string()),
+                },
+                DirectDep {
+                    name: "color".to_string(),
+                    dep_path: "color@1.0.0".to_string(),
+                    dep_type: DepType::Production,
+                    specifier: Some("1.0.0".to_string()),
+                },
+            ],
+        );
+
+        let identities = cyclic_peer_identities(&g);
+
+        assert!(identities.contains("host@1.0.0"));
+        assert!(identities.contains("plugin@1.0.0"));
+        assert!(!identities.contains("host@2.0.0"));
+    }
+
+    #[test]
+    fn peer_cycle_providers_use_bare_identities_for_outside_consumers() {
+        let mut g = LockfileGraph::default();
+        for (name, peers) in [
+            ("r2-host", vec!["r2-color", "r2-plugin"]),
+            ("r2-plugin", vec!["r2-color", "r2-host"]),
+            ("r2-consumer", vec!["r2-host"]),
+            ("r2-color", vec![]),
+        ] {
+            let mut pkg = locked(name, &[]);
+            pkg.peer_dependencies = peers
+                .into_iter()
+                .map(|name| (name.to_string(), "*".to_string()))
+                .collect();
+            g.importers
+                .entry(".".to_string())
+                .or_default()
+                .push(DirectDep {
+                    name: name.to_string(),
+                    dep_path: pkg.dep_path.clone(),
+                    dep_type: DepType::Production,
+                    specifier: Some("1.0.0".to_string()),
+                });
+            g.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+        let graph = g.clone();
+        let out = apply_peer_contexts(g, &PeerContextOptions::default()).expect("peer pass");
+        assert_eq!(
+            out.packages.keys().cloned().collect::<Vec<_>>(),
+            [
+                "r2-color@1.0.0",
+                "r2-consumer@1.0.0(r2-host@1.0.0)",
+                "r2-host@1.0.0(r2-color@1.0.0)(r2-plugin@1.0.0)",
+                "r2-plugin@1.0.0(r2-color@1.0.0)(r2-host@1.0.0)",
+            ]
+        );
+
+        let hashed = apply_peer_contexts(
+            graph,
+            &PeerContextOptions {
+                peers_suffix_max_length: 1,
+                ..Default::default()
+            },
+        )
+        .expect("hashed peer pass");
+        // Hashes taken from pnpm 12.14.0 and 11.10.0 on the same shape.
+        assert!(
+            hashed
+                .packages
+                .contains_key("r2-consumer@1.0.0(113cafeb2fbd38e575aa85615239a287)"),
+            "got keys: {:?}",
+            hashed.packages.keys().collect::<Vec<_>>()
         );
     }
 
