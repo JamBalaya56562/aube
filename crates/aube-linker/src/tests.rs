@@ -877,6 +877,91 @@ fn dedupe_reports_a_member_link_it_cannot_remove() {
 }
 
 #[test]
+fn link_all_links_dependencies_of_physical_file_link_importers() {
+    for node_linker in [NodeLinker::Isolated, NodeLinker::Hoisted] {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join("vendor/host")).unwrap();
+
+        let (store, indices) = setup_store_with_files(dir.path());
+        let mut graph = make_graph();
+        graph.importers.insert(".".to_string(), Vec::new());
+        graph.importers.insert(
+            "vendor/host".to_string(),
+            vec![DirectDep {
+                name: "bar".to_string(),
+                dep_path: "bar@2.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            }],
+        );
+        Linker::new(&store, LinkStrategy::Copy)
+            .with_node_linker(node_linker)
+            .link_all(&project_dir, &graph, &indices)
+            .unwrap();
+
+        // Hoisted may place the dependency at the root, which the linked
+        // directory still resolves through its parent `node_modules`.
+        assert!(
+            ["vendor/host/node_modules/bar", "node_modules/bar"]
+                .iter()
+                .any(|path| project_dir.join(path).join("index.js").exists()),
+            "{node_linker:?}: the linked directory must reach its own dependency"
+        );
+    }
+}
+
+#[test]
+fn link_all_sweeps_stale_tmp_dirs_when_delegating_to_the_workspace_linker() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(project_dir.join("vendor/host")).unwrap();
+    let stale = project_dir.join("node_modules/.aube/.tmp-1-0");
+    std::fs::create_dir_all(&stale).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph
+        .importers
+        .insert("vendor/host".to_string(), Vec::new());
+    Linker::new(&store, LinkStrategy::Copy)
+        .link_all(&project_dir, &graph, &indices)
+        .unwrap();
+
+    assert!(!stale.exists());
+}
+
+#[test]
+fn virtual_store_only_sweeps_visible_links_of_physical_file_link_importers() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(project_dir.join("vendor/host")).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph.importers.insert(
+        "vendor/host".to_string(),
+        vec![DirectDep {
+            name: "bar".to_string(),
+            dep_path: "bar@2.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let host_bar = project_dir.join("vendor/host/node_modules/bar");
+    Linker::new(&store, LinkStrategy::Copy)
+        .link_all(&project_dir, &graph, &indices)
+        .unwrap();
+    assert!(host_bar.join("index.js").exists());
+
+    Linker::new(&store, LinkStrategy::Copy)
+        .with_virtual_store_only(true)
+        .link_all(&project_dir, &graph, &indices)
+        .unwrap();
+    assert!(!host_bar.exists());
+}
+
+#[test]
 fn workspace_selected_package_materializes_locally_while_dependencies_use_gvs() {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
@@ -2593,6 +2678,27 @@ fn hidden_hoist_keeps_root_deps_when_root_links_are_skipped() {
         std::fs::read_to_string(hidden.join("is-odd/index.js")).unwrap(),
         "module.exports = 'is-odd@3.0.1';"
     );
+}
+
+#[test]
+fn virtual_store_only_keeps_a_virtual_store_dir_inside_a_physical_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(project_dir.join("vendor/host")).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph
+        .importers
+        .insert("vendor/host".to_string(), Vec::new());
+    let virtual_store = project_dir.join("vendor/host/node_modules/store");
+    Linker::new(&store, LinkStrategy::Copy)
+        .with_virtual_store_only(true)
+        .with_aube_dir_override(virtual_store.clone())
+        .link_all(&project_dir, &graph, &indices)
+        .unwrap();
+
+    assert!(virtual_store.join("foo@1.0.0").exists());
 }
 
 #[test]

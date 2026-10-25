@@ -52,6 +52,15 @@ impl Linker {
         graph: &LockfileGraph,
         package_indices: &BTreeMap<String, PackageIndex>,
     ) -> Result<LinkStats, Error> {
+        // npm locks also carry physical importers for live file links in
+        // single-package projects. Their dependencies must reach the source.
+        if graph
+            .importers
+            .keys()
+            .any(|path| path != "." && is_physical_importer(path))
+        {
+            return self.link_workspace(project_dir, graph, package_indices, &BTreeMap::new());
+        }
         let project_dir = aube_util::path::normalize_lexical(project_dir);
         let modules_dir = self.checked_modules_dir(&project_dir)?;
         if matches!(self.node_linker, NodeLinker::Hoisted) {
@@ -855,6 +864,10 @@ impl Linker {
         mkdirp(&aube_dir)?;
         mkdirp(&root_nm)?;
 
+        // Reclaim `.tmp-<pid>-*` dirs left by aborted installs, as
+        // `link_all` does for a single project.
+        sweep_stale_tmp_dirs(&aube_dir);
+
         let mut stats = LinkStats::default();
 
         // Patch reconciliation. Mirrors `link_all`'s logic: wipe
@@ -1200,6 +1213,28 @@ impl Linker {
                         continue;
                     }
                     try_remove_entry(&entry.path());
+                }
+            }
+            // Physical importers (workspace members, npm file links)
+            // keep their own visible `node_modules/<name>` links.
+            for importer_path in graph.importers.keys() {
+                if importer_path == "." || !is_physical_importer(importer_path) {
+                    continue;
+                }
+                let importer_dir = crate::relocated_importer_dir(&root_dir, importer_path)
+                    .unwrap_or_else(|| {
+                        aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                    });
+                let Ok(entries) = std::fs::read_dir(importer_dir.join(&self.modules_dir_name))
+                else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if entry.path() != aube_dir
+                        && !entry.file_name().to_string_lossy().starts_with('.')
+                    {
+                        try_remove_entry(&entry.path());
+                    }
                 }
             }
             self.link_hidden_hoist(&aube_dir, &root_nm, graph)?;
